@@ -1,0 +1,1981 @@
+package com.termux.app;
+
+import android.annotation.SuppressLint;
+import android.app.AlertDialog;
+import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.ServiceConnection;
+import android.content.SharedPreferences;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Environment;
+import android.os.IBinder;
+import android.provider.Settings;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
+import android.view.ContextMenu;
+import android.view.ContextMenu.ContextMenuInfo;
+import android.view.Gravity;
+import android.view.Menu;
+import android.view.MenuItem;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.widget.EditText;
+import android.widget.ImageButton;
+import android.widget.LinearLayout;
+import android.widget.ListView;
+import android.widget.RelativeLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import com.google.android.material.button.MaterialButton;
+
+import com.termux.BuildConfig;
+import com.termux.R;
+import com.termux.app.api.file.FileReceiverActivity;
+import com.termux.app.terminal.TermuxActivityRootView;
+import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
+import com.termux.app.terminal.io.TermuxTerminalExtraKeys;
+import com.termux.shared.activities.ReportActivity;
+import com.termux.shared.activity.ActivityUtils;
+import com.termux.shared.activity.media.AppCompatActivityUtils;
+import com.termux.shared.data.IntentUtils;
+import com.termux.shared.android.PermissionUtils;
+import com.termux.shared.data.DataUtils;
+import com.termux.shared.termux.TermuxConstants;
+import com.termux.shared.termux.TermuxConstants.TERMUX_APP.TERMUX_ACTIVITY;
+import com.termux.app.activities.HelpActivity;
+import com.termux.app.activities.SettingsActivity;
+import com.termux.shared.termux.crash.TermuxCrashUtils;
+import com.termux.shared.termux.settings.preferences.TermuxAppSharedPreferences;
+import com.termux.app.terminal.TermuxSessionsListViewController;
+import com.termux.app.terminal.io.TerminalToolbarViewPager;
+import com.termux.app.terminal.TermuxTerminalViewClient;
+import com.termux.shared.termux.extrakeys.ExtraKeysView;
+import com.termux.shared.termux.interact.TextInputDialogUtils;
+import com.termux.shared.logger.Logger;
+import com.termux.shared.termux.TermuxUtils;
+import com.termux.shared.termux.settings.properties.TermuxAppSharedProperties;
+import com.termux.shared.termux.theme.TermuxThemeUtils;
+import com.termux.shared.theme.NightMode;
+import com.termux.shared.view.ViewUtils;
+import com.termux.terminal.TerminalSession;
+import com.termux.terminal.TerminalSessionClient;
+import com.termux.view.TerminalView;
+import com.termux.view.TerminalViewClient;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import androidx.drawerlayout.widget.DrawerLayout;
+import androidx.viewpager.widget.ViewPager;
+
+import android.Manifest;
+import android.content.pm.PackageManager;
+
+import com.newtermux.features.AutoCorrectHandler;
+import com.newtermux.features.NewTermuxSettings;
+import com.newtermux.features.NewTermuxTheme;
+import com.newtermux.features.RootToggleManager;
+import com.newtermux.features.SpeechInputManager;
+import com.termux.app.terminal.MiniTerminalPipView;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
+import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+
+/**
+ * A terminal emulator activity.
+ * <p/>
+ * See
+ * <ul>
+ * <li>http://www.mongrel-phones.com.au/default/how_to_make_a_local_service_and_bind_to_it_in_android</li>
+ * <li>https://code.google.com/p/android/issues/detail?id=6426</li>
+ * </ul>
+ * about memory leaks.
+ */
+public final class TermuxActivity extends AppCompatActivity implements ServiceConnection {
+
+    /**
+     * The connection to the {@link TermuxService}. Requested in {@link #onCreate(Bundle)} with a call to
+     * {@link #bindService(Intent, ServiceConnection, int)}, and obtained and stored in
+     * {@link #onServiceConnected(ComponentName, IBinder)}.
+     */
+    TermuxService mTermuxService;
+
+    /**
+     * The {@link TerminalView} shown in  {@link TermuxActivity} that displays the terminal.
+     */
+    TerminalView mTerminalView;
+
+    /**
+     *  The {@link TerminalViewClient} interface implementation to allow for communication between
+     *  {@link TerminalView} and {@link TermuxActivity}.
+     */
+    TermuxTerminalViewClient mTermuxTerminalViewClient;
+
+    /**
+     *  The {@link TerminalSessionClient} interface implementation to allow for communication between
+     *  {@link TerminalSession} and {@link TermuxActivity}.
+     */
+    TermuxTerminalSessionActivityClient mTermuxTerminalSessionActivityClient;
+
+    /**
+     * Termux app shared preferences manager.
+     */
+    private TermuxAppSharedPreferences mPreferences;
+
+    /**
+     * Termux app SharedProperties loaded from termux.properties
+     */
+    private TermuxAppSharedProperties mProperties;
+
+    /**
+     * The root view of the {@link TermuxActivity}.
+     */
+    TermuxActivityRootView mTermuxActivityRootView;
+
+    /**
+     * The space at the bottom of {@link @mTermuxActivityRootView} of the {@link TermuxActivity}.
+     */
+    View mTermuxActivityBottomSpaceView;
+
+    /**
+     * The terminal extra keys view.
+     */
+    ExtraKeysView mExtraKeysView;
+
+    /**
+     * The client for the {@link #mExtraKeysView}.
+     */
+    TermuxTerminalExtraKeys mTermuxTerminalExtraKeys;
+
+    /** Whether extra keys were placed in the right drawer at activity creation time. */
+    private boolean mExtraKeysInDrawerModeAtCreation = false;
+
+    /**
+     * The termux sessions list controller.
+     */
+    TermuxSessionsListViewController mTermuxSessionListViewController;
+
+    /**
+     * The {@link TermuxActivity} broadcast receiver for various things like terminal style configuration changes.
+     */
+    private final BroadcastReceiver mTermuxActivityBroadcastReceiver = new TermuxActivityBroadcastReceiver();
+
+    /**
+     * The last toast shown, used cancel current toast before showing new in {@link #showToast(String, boolean)}.
+     */
+    Toast mLastToast;
+
+    /**
+     * If between onResume() and onStop(). Note that only one session is in the foreground of the terminal view at the
+     * time, so if the session causing a change is not in the foreground it should probably be treated as background.
+     */
+    private boolean mIsVisible;
+
+    /**
+     * If onResume() was called after onCreate().
+     */
+    private boolean mIsOnResumeAfterOnCreate = false;
+
+    /**
+     * If activity was restarted like due to call to {@link #recreate()} after receiving
+     * {@link TERMUX_ACTIVITY#ACTION_RELOAD_STYLE}, system dark night mode was changed or activity
+     * was killed by android.
+     */
+    private boolean mIsActivityRecreated = false;
+
+    /**
+     * The {@link TermuxActivity} is in an invalid state and must not be run.
+     */
+    private boolean mIsInvalidState;
+
+    private int mNavBarHeight;
+
+    private float mTerminalToolbarDefaultHeight;
+
+
+    // NewTermux features
+    private SpeechInputManager mSpeechInputManager;
+    private RootToggleManager mRootToggleManager;
+    private AutoCorrectHandler mAutoCorrectHandler;
+    private com.newtermux.features.PackageManagerMenu mPackageManagerMenu;
+    private View mAutocorrectBar;
+    private TextView mAutocorrectText;
+    private String mPendingCorrection;
+    private String mPendingOriginal;
+    private ImageButton mBtnSTT;
+    private ImageButton mBtnRootToggle;
+    private LinearLayout mSessionPipContainer;
+    private static final int REQUEST_RECORD_AUDIO = 201;
+
+    // SAF launchers for Export Screen and Make Script
+    private ActivityResultLauncher<String> mScreenExportSaver;
+    private ActivityResultLauncher<String> mScriptSaver;
+    private final List<String> mPendingScriptLines = new ArrayList<>();
+
+    private static final int CONTEXT_MENU_SELECT_URL_ID = 0;
+    private static final int CONTEXT_MENU_SHARE_TRANSCRIPT_ID = 1;
+    private static final int CONTEXT_MENU_SHARE_SELECTED_TEXT = 10;
+    private static final int CONTEXT_MENU_AUTOFILL_USERNAME = 11;
+    private static final int CONTEXT_MENU_AUTOFILL_PASSWORD = 2;
+    private static final int CONTEXT_MENU_RESET_TERMINAL_ID = 3;
+    private static final int CONTEXT_MENU_KILL_PROCESS_ID = 4;
+    private static final int CONTEXT_MENU_STYLING_ID = 5;
+    private static final int CONTEXT_MENU_TOGGLE_KEEP_SCREEN_ON = 6;
+    private static final int CONTEXT_MENU_HELP_ID = 7;
+    private static final int CONTEXT_MENU_SETTINGS_ID = 8;
+    private static final int CONTEXT_MENU_REPORT_ID = 9;
+
+    private static final String ARG_TERMINAL_TOOLBAR_TEXT_INPUT = "terminal_toolbar_text_input";
+    private static final String ARG_ACTIVITY_RECREATED = "activity_recreated";
+
+    private static final String LOG_TAG = "TermuxActivity";
+
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        Logger.logDebug(LOG_TAG, "onCreate");
+        mIsOnResumeAfterOnCreate = true;
+
+        if (savedInstanceState != null)
+            mIsActivityRecreated = savedInstanceState.getBoolean(ARG_ACTIVITY_RECREATED, false);
+
+        // Delete ReportInfo serialized object files from cache older than 14 days
+        ReportActivity.deleteReportInfoFilesOlderThanXDays(this, 14, false);
+
+        // Load Termux app SharedProperties from disk
+        mProperties = TermuxAppSharedProperties.getProperties();
+        reloadProperties();
+
+        setActivityTheme();
+
+        super.onCreate(savedInstanceState);
+
+        setContentView(R.layout.activity_termux);
+
+        // Load termux shared preferences
+        // This will also fail if TermuxConstants.TERMUX_PACKAGE_NAME does not equal applicationId
+        mPreferences = TermuxAppSharedPreferences.build(this, true);
+        if (mPreferences == null) {
+            // An AlertDialog should have shown to kill the app, so we don't continue running activity code
+            mIsInvalidState = true;
+            return;
+        }
+
+        setMargins();
+
+        mTermuxActivityRootView = findViewById(R.id.activity_termux_root_view);
+        mTermuxActivityRootView.setActivity(this);
+        mTermuxActivityBottomSpaceView = findViewById(R.id.activity_termux_bottom_space_view);
+        mTermuxActivityRootView.setOnApplyWindowInsetsListener(new TermuxActivityRootView.WindowInsetsListener());
+
+        View content = findViewById(android.R.id.content);
+        content.setOnApplyWindowInsetsListener((v, insets) -> {
+            mNavBarHeight = insets.getSystemWindowInsetBottom();
+            return insets;
+        });
+
+        if (mProperties.isUsingFullScreen()) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        }
+
+        setTermuxTerminalViewAndClients();
+
+        setTerminalToolbarView(savedInstanceState);
+
+        mScreenExportSaver = registerForActivityResult(
+            new ActivityResultContracts.CreateDocument("text/plain"),
+            uri -> {
+                if (uri == null) return;
+                TerminalSession session = getCurrentSession();
+                if (session == null) return;
+                String text = session.getEmulator().getScreen().getTranscriptText();
+                new Thread(() -> {
+                    try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                        if (os != null) os.write(text.getBytes());
+                        runOnUiThread(() -> Toast.makeText(this, "Captura de pantalla exportada", Toast.LENGTH_SHORT).show());
+                    } catch (Exception e) {
+                        runOnUiThread(() -> Toast.makeText(this, "Error al exportar: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                    }
+                }).start();
+            });
+
+        mScriptSaver = registerForActivityResult(
+            new ActivityResultContracts.CreateDocument("text/x-shellscript"),
+            uri -> {
+                if (uri == null || mPendingScriptLines.isEmpty()) return;
+                List<String> lines = new ArrayList<>(mPendingScriptLines);
+                mPendingScriptLines.clear();
+                new Thread(() -> {
+                    try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                        if (os == null) return;
+                        os.write("#!/bin/zsh\n".getBytes());
+                        for (String line : lines) {
+                            os.write((line + "\n").getBytes());
+                        }
+                        runOnUiThread(() -> Toast.makeText(this, "Script guardado", Toast.LENGTH_SHORT).show());
+                    } catch (Exception e) {
+                        runOnUiThread(() -> Toast.makeText(this, "Error al guardar: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                    }
+                }).start();
+            });
+
+        setupDrawerCommandButtons();
+
+        setupNewTermuxFeatures();
+
+        registerForContextMenu(mTerminalView);
+
+        FileReceiverActivity.updateFileReceiverActivityComponentsState(this);
+
+        try {
+            // Start the {@link TermuxService} and make it run regardless of who is bound to it
+            Intent serviceIntent = new Intent(this, TermuxService.class);
+            startService(serviceIntent);
+
+            // Attempt to bind to the service, this will call the {@link #onServiceConnected(ComponentName, IBinder)}
+            // callback if it succeeds.
+            if (!bindService(serviceIntent, this, 0))
+                throw new RuntimeException("bindService() failed");
+        } catch (Exception e) {
+            Logger.logStackTraceWithMessage(LOG_TAG,"TermuxActivity failed to start TermuxService", e);
+            Logger.showToast(this,
+                getString(e.getMessage() != null && e.getMessage().contains("app is in background") ?
+                    R.string.error_termux_service_start_failed_bg : R.string.error_termux_service_start_failed_general),
+                true);
+            mIsInvalidState = true;
+            return;
+        }
+
+        // Send the {@link TermuxConstants#BROADCAST_TERMUX_OPENED} broadcast to notify apps that Termux
+        // app has been opened.
+        TermuxUtils.sendTermuxOpenedBroadcast(this);
+    }
+
+    @Override
+    public void onStart() {
+        super.onStart();
+
+        Logger.logDebug(LOG_TAG, "onStart");
+
+        if (mIsInvalidState) return;
+
+        mIsVisible = true;
+
+        if (mTermuxTerminalSessionActivityClient != null)
+            mTermuxTerminalSessionActivityClient.onStart();
+
+        if (mTermuxTerminalViewClient != null)
+            mTermuxTerminalViewClient.onStart();
+
+        if (mPreferences.isTerminalMarginAdjustmentEnabled())
+            addTermuxActivityRootViewGlobalLayoutListener();
+
+        registerTermuxActivityBroadcastReceiver();
+
+        // NOTE: the keep-alive wake lock is intentionally NOT released here anymore. It is now tied
+        // to the session lifecycle in TermuxService (held while any session is alive), not to the
+        // Activity lifecycle — releasing it on every foreground transition is what made it flap.
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+
+        Logger.logVerbose(LOG_TAG, "onResume");
+
+        if (mIsInvalidState) return;
+
+        // Re-apply extra keys settings when returning from Settings
+        boolean currentDrawerMode = com.newtermux.features.NewTermuxSettings.isExtraKeysInDrawer(this);
+        if (currentDrawerMode != mExtraKeysInDrawerModeAtCreation) {
+            recreate();
+            return;
+        }
+        if (!currentDrawerMode) {
+            ViewPager vp = getTerminalToolbarViewPager();
+            if (vp != null) {
+                vp.setVisibility(com.newtermux.features.NewTermuxSettings.isExtraKeysVisible(this)
+                    ? View.VISIBLE : View.GONE);
+            }
+        }
+
+        if (mTermuxTerminalSessionActivityClient != null)
+            mTermuxTerminalSessionActivityClient.onResume();
+
+        if (mTermuxTerminalViewClient != null)
+            mTermuxTerminalViewClient.onResume();
+
+        // Check if a crash happened on last run of the app or if a plugin crashed and show a
+        // notification with the crash details if it did
+        TermuxCrashUtils.notifyAppCrashFromCrashLogFile(this, LOG_TAG);
+
+        mIsOnResumeAfterOnCreate = false;
+        applyAccentColor();
+        applyFeatureSettings();
+        if (mTermuxTerminalSessionActivityClient != null)
+            mTermuxTerminalSessionActivityClient.checkForFontAndColors();
+
+        // One-time nudge to allowlist NewTermux from battery optimization / Doze, so the keep-alive
+        // foreground service actually survives backgrounding. Gated: only shows if keep-alive is on,
+        // we are not already exempt, and we have not asked before.
+        maybePromptBatteryOptimization();
+
+        // One-time nudge to grant "All files access" (MANAGE_EXTERNAL_STORAGE) so the terminal can
+        // read/write shared storage. Once granted, set up the ~/storage symlinks.
+        maybePromptAllFilesAccess();
+
+        // Run any command injected by Settings/Paquete Manager (e.g. "pkg install zsh\n") in a
+        // NEW session. Install commands get -y and a clear+exit suffix so they auto-close.
+        String pendingCmd = com.newtermux.features.NewTermuxSettings.getPendingCommand(this);
+        if (pendingCmd != null) {
+            com.newtermux.features.NewTermuxSettings.clearPendingCommand(this);
+            runCommandInNewSession(pendingCmd);
+        }
+    }
+
+    /**
+     * Run {@code command} in a brand new session. Package install/upgrade commands get {@code -y}
+     * injected (so they never block on a confirmation prompt) and a trailing Ctrl+L + exit, which
+     * clears the screen and closes the shell so the throwaway session removes itself automatically.
+     * Used by the Paquete Manager, the Settings "Instalar Zsh" action and the manual pkg/apt
+     * interceptor.
+     */
+    public void runCommandInNewSession(String command) {
+        if (command == null || command.isEmpty()) return;
+        if (mTermuxTerminalSessionActivityClient == null) return;
+
+        String cmd = command.trim();
+        if (cmd.isEmpty()) return;
+        if (com.newtermux.features.PackageInstallInterceptor.isInstallCommand(cmd)) {
+            cmd = com.newtermux.features.PackageInstallInterceptor.withYesFlag(cmd)
+                + "\nprintf '\\014'\nexit\n"; // Ctrl+L (clear) then exit (Ctrl+D)
+        } else {
+            cmd = cmd + "\n";
+        }
+
+        mTermuxTerminalSessionActivityClient.addNewSession(false, null);
+        TerminalSession session = getCurrentSession();
+        if (session != null) {
+            byte[] bytes = cmd.getBytes();
+            session.write(bytes, 0, bytes.length);
+        }
+    }
+
+    /**
+     * Show a one-time dialog asking the user to allowlist NewTermux from battery optimization /
+     * Doze. Without the exemption, Android can still tear the process down in the background even
+     * with a foreground service + wake lock. Gated so it is unobtrusive: only when keep-alive is
+     * enabled, we are not already exempt, and we have not prompted before.
+     */
+    private void maybePromptBatteryOptimization() {
+        if (!com.newtermux.features.NewTermuxSettings.isKeepAliveInBackground(this)) return;
+        if (com.newtermux.features.NewTermuxSettings.wasBatteryOptPrompted(this)) return;
+        if (PermissionUtils.checkIfBatteryOptimizationsDisabled(this)) return;
+
+        // Mark as prompted up front so this only ever appears once, regardless of the user's choice.
+        com.newtermux.features.NewTermuxSettings.setBatteryOptPrompted(this, true);
+
+        new AlertDialog.Builder(this)
+            .setTitle(R.string.battery_opt_prompt_title)
+            .setMessage(R.string.battery_opt_prompt_message)
+            .setPositiveButton(R.string.battery_opt_prompt_allow, (d, w) -> {
+                try {
+                    PermissionUtils.requestDisableBatteryOptimizations(this);
+                } catch (Exception e) {
+                    Logger.logError(LOG_TAG, "Failed to request battery optimization exemption: " + e);
+                }
+            })
+            .setNegativeButton(R.string.battery_opt_prompt_later, null)
+            .show();
+    }
+
+    /**
+     * Show a one-time dialog asking the user to grant "All files access"
+     * ({@link android.Manifest.permission#MANAGE_EXTERNAL_STORAGE}) on Android 11+, so the terminal
+     * can read/write shared storage. Once granted, the ~/storage symlinks are set up. Gated so it is
+     * unobtrusive: skipped on older Android, when already granted, and after it has been shown once.
+     */
+    private void maybePromptAllFilesAccess() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return;
+
+        if (Environment.isExternalStorageManager()) {
+            if (!com.newtermux.features.NewTermuxSettings.wasAllFilesDone(this)) {
+                com.newtermux.features.NewTermuxSettings.setAllFilesDone(this, true);
+                TermuxInstaller.setupStorageSymlinks(this);
+            }
+            return;
+        }
+
+        if (com.newtermux.features.NewTermuxSettings.wasAllFilesPrompted(this)) return;
+
+        // Mark as prompted up front so this only ever appears once, regardless of the user's choice.
+        com.newtermux.features.NewTermuxSettings.setAllFilesPrompted(this, true);
+
+        new AlertDialog.Builder(this)
+            .setTitle(R.string.all_files_prompt_title)
+            .setMessage(R.string.all_files_prompt_message)
+            .setPositiveButton(R.string.all_files_prompt_allow, (d, w) -> {
+                try {
+                    Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                    intent.addCategory("android.intent.category.DEFAULT");
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(intent);
+                } catch (Exception e) {
+                    Logger.logError(LOG_TAG, "Failed to request all files access: " + e);
+                    try {
+                        startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                    } catch (Exception e2) {
+                        Logger.logError(LOG_TAG, "Failed to open all files access settings: " + e2);
+                    }
+                }
+            })
+            .setNegativeButton(R.string.all_files_prompt_later, null)
+            .show();
+    }
+
+    private void applyAccentColor() {
+        int color = NewTermuxTheme.getAccentColor(this);
+
+        // AC toggle button
+        android.widget.TextView btnAC = findViewById(R.id.btn_autocorrect_toggle);
+        if (btnAC != null) {
+            boolean acOn = mTerminalView != null && mTerminalView.isKeyboardSuggestionsEnabled();
+            btnAC.setTextColor(acOn ? color : getResources().getColor(R.color.nt_on_surface, getTheme()));
+        }
+
+        // STT button (idle state)
+        if (mBtnSTT != null) mBtnSTT.setColorFilter(color);
+
+        // Settings cog button
+        ImageButton btnSettings = findViewById(R.id.btn_settings);
+        if (btnSettings != null) btnSettings.setColorFilter(color);
+
+        // Session chips
+        updateSessionTabs();
+
+        // Extra keys buttons (live refresh so the accent applies immediately, like the rest of the UI)
+        if (mExtraKeysView != null) mExtraKeysView.updateButtonAccentColor(color);
+
+        // Drawer command buttons
+        setupDrawerCommandButtons();
+    }
+
+    private void applyFeatureSettings() {
+        setVisible(R.id.btn_autocorrect_toggle, NewTermuxSettings.isShowAcButton(this));
+        setVisible(R.id.btn_root_toggle, NewTermuxSettings.isShowRootButton(this));
+        setVisible(R.id.btn_stt, NewTermuxSettings.isShowSttButton(this));
+        setVisible(R.id.btn_packages_menu, NewTermuxSettings.isShowPackagesButton(this));
+        setVisible(R.id.btn_clear_terminal, NewTermuxSettings.isShowClearButton(this));
+        // Hide/show the whole scroll container (chip group lives inside it)
+        setVisible(R.id.session_tabs_scroll, NewTermuxSettings.isSessionTabsEnabled(this));
+        // Autocorrect initial enabled state
+        if (mAutoCorrectHandler != null)
+            mAutoCorrectHandler.setEnabled(NewTermuxSettings.isAutocorrectEnabled(this));
+    }
+
+    private void setVisible(int id, boolean visible) {
+        View v = findViewById(id);
+        if (v != null) v.setVisibility(visible ? View.VISIBLE : View.GONE);
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+
+        Logger.logDebug(LOG_TAG, "onStop");
+
+        if (mIsInvalidState) return;
+
+        mIsVisible = false;
+
+        if (mTermuxTerminalSessionActivityClient != null)
+            mTermuxTerminalSessionActivityClient.onStop();
+
+        if (mTermuxTerminalViewClient != null)
+            mTermuxTerminalViewClient.onStop();
+
+        removeTermuxActivityRootViewGlobalLayoutListener();
+
+        unregisterTermuxActivityBroadcastReceiver();
+        getDrawer().closeDrawers();
+
+        // Snapshot the current tab list to disk as we go to background, so that if the process is
+        // torn down while a game is in the foreground, the next launch can rehydrate the tabs. The
+        // keep-alive wake lock is already held continuously by the service (session-driven).
+        if (mTermuxService != null)
+            SessionStatePersister.save(this, mTermuxService.getTermuxSessions());
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+
+        Logger.logDebug(LOG_TAG, "onDestroy");
+
+        if (mIsInvalidState) return;
+
+        if (mSpeechInputManager != null) { mSpeechInputManager.destroy(); mSpeechInputManager = null; }
+        if (mAutoCorrectHandler != null) { mAutoCorrectHandler.destroy(); mAutoCorrectHandler = null; }
+
+        if (mTermuxService != null) {
+            // Do not leave service and session clients with references to activity.
+            mTermuxService.unsetTermuxTerminalSessionClient();
+            mTermuxService = null;
+        }
+
+        try {
+            unbindService(this);
+        } catch (Exception e) {
+            // ignore.
+        }
+    }
+
+    @Override
+    public void onSaveInstanceState(@NonNull Bundle savedInstanceState) {
+        Logger.logVerbose(LOG_TAG, "onSaveInstanceState");
+
+        super.onSaveInstanceState(savedInstanceState);
+        saveTerminalToolbarTextInput(savedInstanceState);
+        savedInstanceState.putBoolean(ARG_ACTIVITY_RECREATED, true);
+    }
+
+
+
+
+
+    /**
+     * Part of the {@link ServiceConnection} interface. The service is bound with
+     * {@link #bindService(Intent, ServiceConnection, int)} in {@link #onCreate(Bundle)} which will cause a call to this
+     * callback method.
+     */
+    @Override
+    public void onServiceConnected(ComponentName componentName, IBinder service) {
+        Logger.logDebug(LOG_TAG, "onServiceConnected");
+
+        mTermuxService = ((TermuxService.LocalBinder) service).service;
+
+        final Intent intent = getIntent();
+        setIntent(null);
+
+        if (mTermuxService.isTermuxSessionsEmpty()) {
+            if (mIsVisible) {
+                TermuxInstaller.setupBootstrapIfNeeded(TermuxActivity.this, () -> {
+                    if (mTermuxService == null) return; // Activity might have been destroyed.
+                    try {
+                        boolean launchFailsafe = false;
+                        if (intent != null && intent.getExtras() != null) {
+                            launchFailsafe = intent.getExtras().getBoolean(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
+                        }
+                        mTermuxTerminalSessionActivityClient.addNewSession(launchFailsafe, null);
+                    } catch (WindowManager.BadTokenException e) {
+                        // Activity finished - ignore.
+                    }
+                });
+            } else {
+                // The service connected while not in foreground - just bail out.
+                finishActivityIfNotFinishing();
+            }
+        } else {
+            // If termux was started from launcher "New session" shortcut and activity is recreated,
+            // then the original intent will be re-delivered, resulting in a new session being re-added
+            // each time.
+            if (!mIsActivityRecreated && intent != null && Intent.ACTION_RUN.equals(intent.getAction())) {
+                // Android 7.1 app shortcut from res/xml/shortcuts.xml.
+                boolean isFailSafe = intent.getBooleanExtra(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
+                mTermuxTerminalSessionActivityClient.addNewSession(isFailSafe, null);
+            } else {
+                mTermuxTerminalSessionActivityClient.setCurrentSession(mTermuxTerminalSessionActivityClient.getCurrentStoredSessionOrLast());
+            }
+        }
+
+        // Update the {@link TerminalSession} and {@link TerminalEmulator} clients.
+        mTermuxService.setTermuxTerminalSessionClient(mTermuxTerminalSessionActivityClient);
+
+        // Now that the service is connected and sessions exist, populate the session chips.
+        updateSessionTabs();
+
+        // Make the bundled zsh plugins available without touching ~/.zshrc or the shell.
+        new Thread(() -> TermuxInstaller.installZshPlugins(this)).start();
+
+        // Request storage permission on every launch; no-op if already granted.
+        // Demo build: skip entirely — demo has no real filesystem, setupStorageSymlinks
+        // would try to access /data/data/com.termux/ which the demo package cannot reach.
+        if (!BuildConfig.IS_DEMO) requestStoragePermission(false);
+    }
+
+    @Override
+    public void onServiceDisconnected(ComponentName name) {
+        Logger.logDebug(LOG_TAG, "onServiceDisconnected");
+
+        // Respect being stopped from the {@link TermuxService} notification action.
+        finishActivityIfNotFinishing();
+    }
+
+
+
+
+
+
+    private void reloadProperties() {
+        mProperties.loadTermuxPropertiesFromDisk();
+
+        if (mTermuxTerminalViewClient != null)
+            mTermuxTerminalViewClient.onReloadProperties();
+    }
+
+
+
+    private void setActivityTheme() {
+        // Update NightMode.APP_NIGHT_MODE
+        TermuxThemeUtils.setAppNightMode(mProperties.getNightMode());
+
+        // Set activity night mode. If NightMode.SYSTEM is set, then android will automatically
+        // trigger recreation of activity when uiMode/dark mode configuration is changed so that
+        // day or night theme takes affect.
+        AppCompatActivityUtils.setNightMode(this, NightMode.getAppNightMode().getName(), true);
+    }
+
+    private void setMargins() {
+        RelativeLayout relativeLayout = findViewById(R.id.activity_termux_root_relative_layout);
+        int marginHorizontal = mProperties.getTerminalMarginHorizontal();
+        int marginVertical = mProperties.getTerminalMarginVertical();
+        ViewUtils.setLayoutMarginsInDp(relativeLayout, marginHorizontal, marginVertical, marginHorizontal, marginVertical);
+    }
+
+
+
+    public void addTermuxActivityRootViewGlobalLayoutListener() {
+        getTermuxActivityRootView().getViewTreeObserver().addOnGlobalLayoutListener(getTermuxActivityRootView());
+    }
+
+    public void removeTermuxActivityRootViewGlobalLayoutListener() {
+        if (getTermuxActivityRootView() != null)
+            getTermuxActivityRootView().getViewTreeObserver().removeOnGlobalLayoutListener(getTermuxActivityRootView());
+    }
+
+
+
+    private void setTermuxTerminalViewAndClients() {
+        // Set termux terminal view and session clients
+        mTermuxTerminalSessionActivityClient = new TermuxTerminalSessionActivityClient(this);
+        mTermuxTerminalViewClient = new TermuxTerminalViewClient(this, mTermuxTerminalSessionActivityClient);
+
+        // Set termux terminal view
+        mTerminalView = findViewById(R.id.terminal_view);
+        mTerminalView.setTerminalViewClient(mTermuxTerminalViewClient);
+
+        if (mTermuxTerminalViewClient != null)
+            mTermuxTerminalViewClient.onCreate();
+
+        if (mTermuxTerminalSessionActivityClient != null)
+            mTermuxTerminalSessionActivityClient.onCreate();
+    }
+
+
+
+
+    private void setTerminalToolbarView(Bundle savedInstanceState) {
+        mTermuxTerminalExtraKeys = new TermuxTerminalExtraKeys(this, mTerminalView,
+            mTermuxTerminalViewClient, mTermuxTerminalSessionActivityClient);
+
+        final ViewPager terminalToolbarViewPager = getTerminalToolbarViewPager();
+
+        ViewGroup.LayoutParams layoutParams = terminalToolbarViewPager.getLayoutParams();
+        mTerminalToolbarDefaultHeight = layoutParams.height;
+
+        boolean inDrawer = com.newtermux.features.NewTermuxSettings.isExtraKeysInDrawer(this);
+        mExtraKeysInDrawerModeAtCreation = inDrawer;
+        getDrawer().setDrawerLockMode(
+            inDrawer ? DrawerLayout.LOCK_MODE_UNLOCKED : DrawerLayout.LOCK_MODE_LOCKED_CLOSED,
+            Gravity.END);
+
+        if (inDrawer) {
+            // Route extra keys into the right drawer instead of the bottom ViewPager
+            ExtraKeysView rightEkv = (ExtraKeysView) findViewById(R.id.right_drawer_extra_keys);
+            if (rightEkv != null) {
+                rightEkv.setExtraKeysViewClient(mTermuxTerminalExtraKeys);
+                rightEkv.setButtonTextAllCaps(getProperties().shouldExtraKeysTextBeAllCaps());
+                rightEkv.setButtonAccentColor(NewTermuxTheme.getAccentColor(this));
+                mExtraKeysView = rightEkv;
+                rightEkv.reload(mTermuxTerminalExtraKeys.getExtraKeysInfo(), mTerminalToolbarDefaultHeight);
+                // GridLayout buttons use height=0 + FILL — the view needs a fixed height to expand into
+                if (mTermuxTerminalExtraKeys.getExtraKeysInfo() != null) {
+                    int rowCount = mTermuxTerminalExtraKeys.getExtraKeysInfo().getMatrix().length;
+                    int totalHeight = Math.round(mTerminalToolbarDefaultHeight * rowCount
+                        * mProperties.getTerminalToolbarHeightScaleFactor());
+                    ViewGroup.LayoutParams ekParams = rightEkv.getLayoutParams();
+                    ekParams.height = totalHeight;
+                    rightEkv.setLayoutParams(ekParams);
+                }
+            }
+            // ViewPager stays GONE; no adapter set in drawer mode
+        } else {
+            if (com.newtermux.features.NewTermuxSettings.isExtraKeysVisible(this)) {
+                terminalToolbarViewPager.setVisibility(View.VISIBLE);
+            }
+            setTerminalToolbarHeight();
+
+            String savedTextInput = null;
+            if (savedInstanceState != null)
+                savedTextInput = savedInstanceState.getString(ARG_TERMINAL_TOOLBAR_TEXT_INPUT);
+
+            terminalToolbarViewPager.setAdapter(new TerminalToolbarViewPager.PageAdapter(this, savedTextInput));
+            terminalToolbarViewPager.addOnPageChangeListener(new TerminalToolbarViewPager.OnPageChangeListener(this, terminalToolbarViewPager));
+        }
+    }
+
+    private void setTerminalToolbarHeight() {
+        final ViewPager terminalToolbarViewPager = getTerminalToolbarViewPager();
+        if (terminalToolbarViewPager == null) return;
+
+        ViewGroup.LayoutParams layoutParams = terminalToolbarViewPager.getLayoutParams();
+        layoutParams.height = Math.round(mTerminalToolbarDefaultHeight *
+            (mTermuxTerminalExtraKeys.getExtraKeysInfo() == null ? 0 : mTermuxTerminalExtraKeys.getExtraKeysInfo().getMatrix().length) *
+            mProperties.getTerminalToolbarHeightScaleFactor());
+        terminalToolbarViewPager.setLayoutParams(layoutParams);
+    }
+
+    public void toggleTerminalToolbar() {
+        if (mExtraKeysInDrawerModeAtCreation) return; // in drawer mode — use right drawer swipe instead
+        final ViewPager terminalToolbarViewPager = getTerminalToolbarViewPager();
+        if (terminalToolbarViewPager == null) return;
+
+        final boolean showNow = mPreferences.toogleShowTerminalToolbar();
+        Logger.showToast(this, (showNow ? getString(R.string.msg_enabling_terminal_toolbar) : getString(R.string.msg_disabling_terminal_toolbar)), true);
+        terminalToolbarViewPager.setVisibility(showNow ? View.VISIBLE : View.GONE);
+        if (showNow && isTerminalToolbarTextInputViewSelected()) {
+            // Focus the text input view if just revealed.
+            findViewById(R.id.terminal_toolbar_text_input).requestFocus();
+        }
+    }
+
+    private void saveTerminalToolbarTextInput(Bundle savedInstanceState) {
+        if (savedInstanceState == null) return;
+
+        final EditText textInputView = findViewById(R.id.terminal_toolbar_text_input);
+        if (textInputView != null) {
+            String textInput = textInputView.getText().toString();
+            if (!textInput.isEmpty()) savedInstanceState.putString(ARG_TERMINAL_TOOLBAR_TEXT_INPUT, textInput);
+        }
+    }
+
+
+
+    // -----------------------------------------------------------------------------------------
+    // NewTermux Features: Speech-to-Text, Root Toggle, AutoCorrect
+    // -----------------------------------------------------------------------------------------
+
+    private void setupNewTermuxFeatures() {
+        // Initialize managers
+        mSpeechInputManager = new SpeechInputManager(this);
+        mRootToggleManager = RootToggleManager.getInstance();
+        mAutoCorrectHandler = new AutoCorrectHandler(this);
+        mPackageManagerMenu = new com.newtermux.features.PackageManagerMenu(this);
+
+        // Autocorrect UI
+        mAutocorrectBar = findViewById(R.id.autocorrect_bar);
+        mAutocorrectText = findViewById(R.id.autocorrect_text);
+        View btnApply = findViewById(R.id.autocorrect_apply_button);
+        View btnClose = findViewById(R.id.autocorrect_close_button);
+        if (btnApply != null) btnApply.setOnClickListener(v -> applyAutocorrect());
+        if (btnClose != null) btnClose.setOnClickListener(v -> hideAutocorrectBar());
+
+        // Wire toolbar buttons
+        mBtnSTT = findViewById(R.id.btn_stt);
+        if (mBtnSTT != null) {
+            mBtnSTT.setOnClickListener(v -> onSTTButtonClicked());
+            if (!SpeechInputManager.isAvailable(this)) {
+                mBtnSTT.setAlpha(0.4f);
+            }
+        }
+
+        mBtnRootToggle = findViewById(R.id.btn_root_toggle);
+        if (mBtnRootToggle != null) {
+            if (RootToggleManager.isDeviceRooted()) {
+                mBtnRootToggle.setVisibility(View.VISIBLE);
+                mBtnRootToggle.setOnClickListener(v -> onRootToggleClicked());
+            } else {
+                mBtnRootToggle.setVisibility(View.GONE);
+            }
+        }
+
+        View btnPackages = findViewById(R.id.btn_packages_menu);
+        if (btnPackages != null) {
+            btnPackages.setOnClickListener(v -> mPackageManagerMenu.show(v));
+            btnPackages.setOnLongClickListener(v -> {
+                startActivity(new Intent(this, com.termux.app.activities.PackageManagerActivity.class));
+                return true;
+            });
+        }
+
+        View btnClear = findViewById(R.id.btn_clear_terminal);
+        if (btnClear != null) {
+            btnClear.setOnClickListener(v -> {
+                TerminalSession session = getCurrentSession();
+                if (session != null) {
+                    // Ctrl+L (form feed) clears the screen exactly like the keyboard shortcut,
+                    // without spawning the `clear` command in the shell.
+                    byte[] bytes = {0x0c};
+                    session.write(bytes, 0, bytes.length);
+                }
+            });
+        }
+
+        ImageButton btnSettings = findViewById(R.id.btn_settings);
+        if (btnSettings != null) {
+            btnSettings.setOnClickListener(v -> {
+                ActivityUtils.startActivity(this, new Intent(this, SettingsActivity.class));
+            });
+        }
+
+        android.widget.TextView btnAC = findViewById(R.id.btn_autocorrect_toggle);
+        if (btnAC != null) {
+            // Apply saved AC state
+            boolean acEnabled = NewTermuxSettings.isKeyboardSuggestionsEnabled(this);
+            mTerminalView.setKeyboardSuggestionsEnabled(acEnabled);
+            if (mAutoCorrectHandler != null) mAutoCorrectHandler.setEnabled(acEnabled);
+
+            btnAC.setOnClickListener(v -> {
+                boolean nowEnabled = !mTerminalView.isKeyboardSuggestionsEnabled();
+                mTerminalView.setKeyboardSuggestionsEnabled(nowEnabled);
+                if (mAutoCorrectHandler != null) mAutoCorrectHandler.setEnabled(nowEnabled);
+                NewTermuxSettings.setKeyboardSuggestions(this, nowEnabled);
+                int color = getResources().getColor(
+                    nowEnabled ? R.color.nt_primary : R.color.nt_on_surface, getTheme());
+                btnAC.setTextColor(color);
+            });
+        }
+
+        ImageButton btnNewSession = findViewById(R.id.btn_new_session);
+        if (btnNewSession != null) {
+            btnNewSession.setOnClickListener(v -> {
+                if (mTermuxTerminalSessionActivityClient != null) {
+                    mTermuxTerminalSessionActivityClient.addNewSession(false, null);
+                }
+            });
+        }
+
+        // Session pip row
+        mSessionPipContainer = findViewById(R.id.session_pip_container);
+        updateSessionTabs();
+
+        // STT result callback
+        mSpeechInputManager.setCallback(new SpeechInputManager.SpeechCallback() {
+            @Override
+            public void onResult(String text) {
+                runOnUiThread(() -> insertSpeechTextToTerminal(text));
+            }
+            @Override
+            public void onError(String error) {
+                runOnUiThread(() -> showToast(error, false));
+            }
+            @Override
+            public void onListeningStarted() {
+                runOnUiThread(() -> updateSTTButtonState(true));
+            }
+            @Override
+            public void onListeningStopped() {
+                runOnUiThread(() -> updateSTTButtonState(false));
+            }
+        });
+    }
+
+    /** Update the horizontal session pip row with live mini terminal previews. */
+    public void updateSessionTabs() {
+        if (mSessionPipContainer == null || mTermuxService == null) return;
+
+        mSessionPipContainer.removeAllViews();
+        java.util.List<com.termux.shared.termux.shell.command.runner.terminal.TermuxSession> sessions = mTermuxService.getTermuxSessions();
+        TerminalSession currentSession = getCurrentSession();
+
+        float density   = getResources().getDisplayMetrics().density;
+        int pipWidthPx  = (int) (density * 86);
+        int pipHeightPx = (int) (density * 58);
+        int marginPx    = (int) (density * 4);
+        int labelGapPx  = (int) (density * 2);
+
+        for (int i = 0; i < sessions.size(); i++) {
+            com.termux.shared.termux.shell.command.runner.terminal.TermuxSession termuxSession = sessions.get(i);
+            TerminalSession session = termuxSession.getTerminalSession();
+
+            // Vertical wrapper: name label on top, live pip below
+            LinearLayout wrapper = new LinearLayout(this);
+            wrapper.setOrientation(LinearLayout.VERTICAL);
+            wrapper.setGravity(Gravity.CENTER_HORIZONTAL);
+            LinearLayout.LayoutParams wrapperLp = new LinearLayout.LayoutParams(pipWidthPx, LinearLayout.LayoutParams.WRAP_CONTENT);
+            wrapperLp.setMarginEnd(marginPx);
+            wrapper.setLayoutParams(wrapperLp);
+
+            // Session name label
+            android.widget.TextView nameLabel = new android.widget.TextView(this);
+            String displayName = (session.mSessionName != null && !session.mSessionName.isEmpty())
+                    ? session.mSessionName : "#" + (i + 1);
+            nameLabel.setText(displayName);
+            nameLabel.setTextSize(10f);
+            nameLabel.setTextColor(0xFFAAAAAA);
+            nameLabel.setMaxLines(1);
+            nameLabel.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            nameLabel.setGravity(Gravity.CENTER_HORIZONTAL);
+            LinearLayout.LayoutParams nameLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            nameLp.bottomMargin = labelGapPx;
+            nameLabel.setLayoutParams(nameLp);
+            wrapper.addView(nameLabel);
+
+            // Live pip preview
+            MiniTerminalPipView pip = new MiniTerminalPipView(this);
+            pip.setSession(session);
+            pip.setActive(session == currentSession);
+            pip.setLayoutParams(new LinearLayout.LayoutParams(pipWidthPx, pipHeightPx));
+            wrapper.addView(pip);
+
+            wrapper.setOnClickListener(v -> {
+                if (mTermuxTerminalSessionActivityClient != null) {
+                    mTermuxTerminalSessionActivityClient.setCurrentSession(session);
+                    updateSessionTabs();
+                }
+            });
+
+            wrapper.setOnLongClickListener(v -> {
+                showSessionPopupMenu(v, session);
+                return true;
+            });
+
+            mSessionPipContainer.addView(wrapper);
+        }
+    }
+
+    private void showSessionPopupMenu(View anchor, TerminalSession session) {
+        // Bannerlator-style pop-out menu: rounded + outlined card with a thin gray divider
+        // between options (see NtPopupMenu).
+        com.newtermux.features.NtPopupMenu.showAsDropDown(this, anchor, null,
+            new String[]{"Renombrar", "Cerrar"}, idx -> {
+                if (idx == 0) {
+                    if (mTermuxTerminalSessionActivityClient != null)
+                        mTermuxTerminalSessionActivityClient.renameSession(session);
+                } else {
+                    closeSessionGracefully(session);
+                }
+            });
+    }
+
+    /**
+     * Close a session without force-killing it: interrupt whatever is running, clear the screen and
+     * send EOF (Ctrl+D) plus an automatic Enter so the shell can shut down cleanly. If the primary
+     * sequence does not finish the session, retry with Ctrl+X and finally remove it as a fallback.
+     */
+    private void closeSessionGracefully(final TerminalSession session) {
+        if (session == null) return;
+        final android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
+        // Primary sequence: Ctrl+C, Ctrl+L, Ctrl+D, Enter.
+        writeToSession(session, 0x03);
+        handler.postDelayed(() -> writeToSession(session, 0x0c), 120);
+        handler.postDelayed(() -> writeToSession(session, 0x04), 240);
+        handler.postDelayed(() -> writeToSession(session, '\r'), 360);
+        // Fallback sequence: Ctrl+X, Ctrl+L, Ctrl+D, Enter.
+        handler.postDelayed(() -> writeToSession(session, 0x18), 900);
+        handler.postDelayed(() -> writeToSession(session, 0x0c), 1020);
+        handler.postDelayed(() -> writeToSession(session, 0x04), 1140);
+        handler.postDelayed(() -> writeToSession(session, '\r'), 1260);
+        // Last resort: if the shell is still alive, remove the session from the list.
+        handler.postDelayed(() -> {
+            if (mTermuxTerminalSessionActivityClient != null)
+                mTermuxTerminalSessionActivityClient.removeFinishedSession(session);
+        }, 2200);
+    }
+
+    private void writeToSession(TerminalSession session, int b) {
+        if (session == null) return;
+        byte[] bytes = {(byte) b};
+        session.write(bytes, 0, bytes.length);
+    }
+
+    /**
+     * Notify the pip for a specific session to redraw (called from onTextChanged).
+     * Only updates the matching pip without rebuilding the whole row.
+     */
+    public void notifyPipUpdate(TerminalSession session) {
+        if (mSessionPipContainer == null) return;
+        for (int i = 0; i < mSessionPipContainer.getChildCount(); i++) {
+            android.view.View child = mSessionPipContainer.getChildAt(i);
+            if (child instanceof ViewGroup) {
+                ViewGroup wrapper = (ViewGroup) child;
+                for (int j = 0; j < wrapper.getChildCount(); j++) {
+                    android.view.View inner = wrapper.getChildAt(j);
+                    if (inner instanceof MiniTerminalPipView) {
+                        MiniTerminalPipView pip = (MiniTerminalPipView) inner;
+                        if (pip.getSession() == session) {
+                            pip.notifyUpdate();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public void onSTTButtonClicked() {
+        if (mSpeechInputManager == null) return;
+        if (mSpeechInputManager.isListening()) {
+            mSpeechInputManager.stopListening();
+            return;
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+        } else {
+            mSpeechInputManager.startListening();
+        }
+    }
+
+    public void checkForAutocorrect(String text) {
+        if (mAutoCorrectHandler == null) return;
+        if (text == null || text.trim().isEmpty()) {
+            hideAutocorrectBar();
+            return;
+        }
+        String corrected = mAutoCorrectHandler.getCommandCorrection(text);
+        if (corrected != null && !corrected.equals(text)) {
+            mPendingCorrection = corrected;
+            mPendingOriginal = text;
+            runOnUiThread(() -> {
+                if (mAutocorrectBar != null && mAutocorrectText != null) {
+                    mAutocorrectText.setText("¿Querías decir: " + corrected + "?");
+                    mAutocorrectBar.setVisibility(View.VISIBLE);
+                }
+            });
+        } else {
+            // If it's a small word or we are done typing, maybe keep it.
+            // For now, only hide if no correction found
+            if (text.length() > 3) hideAutocorrectBar();
+        }
+    }
+
+    private void applyAutocorrect() {
+        if (mPendingCorrection == null || mPendingOriginal == null) return;
+        TerminalSession session = getCurrentSession();
+        if (session != null) {
+            // Send backspaces to delete the original word and the trailing space
+            StringBuilder backspaces = new StringBuilder();
+            for (int i = 0; i < mPendingOriginal.length() + 1; i++) {
+                backspaces.append('\177'); // DEL character for backspace
+            }
+            byte[] bsBytes = backspaces.toString().getBytes();
+            session.write(bsBytes, 0, bsBytes.length);
+
+            // Send the corrected command
+            byte[] bytes = mPendingCorrection.getBytes();
+            session.write(bytes, 0, bytes.length);
+        }
+        hideAutocorrectBar();
+    }
+
+    private void hideAutocorrectBar() {
+        mPendingCorrection = null;
+        runOnUiThread(() -> {
+            if (mAutocorrectBar != null) mAutocorrectBar.setVisibility(View.GONE);
+        });
+    }
+
+    private void onRootToggleClicked() {
+        if (mRootToggleManager == null) return;
+        boolean enable = !mRootToggleManager.isRootEnabled();
+        mRootToggleManager.toggleRoot(enable, new RootToggleManager.RootCallback() {
+            @Override public void onRootGranted() {
+                runOnUiThread(() -> {
+                    updateRootButtonState(true);
+                    showToast("Acceso root activado", false);
+                });
+            }
+            @Override public void onRootDenied(String reason) {
+                runOnUiThread(() -> {
+                    updateRootButtonState(false);
+                    showToast(reason, true);
+                });
+            }
+            @Override public void onRootStateChanged(boolean isRoot) {
+                runOnUiThread(() -> {
+                    updateRootButtonState(isRoot);
+                    showToast(isRoot ? "Root activado" : "Root desactivado", false);
+                });
+            }
+        });
+    }
+
+    private void updateSTTButtonState(boolean isListening) {
+        if (mBtnSTT == null) return;
+        mBtnSTT.setImageResource(isListening ? R.drawable.ic_mic_off : R.drawable.ic_mic);
+        int color = getResources().getColor(
+            isListening ? R.color.nt_stt_listening : R.color.nt_stt_idle, getTheme());
+        mBtnSTT.setColorFilter(color);
+    }
+
+    private void updateRootButtonState(boolean isRoot) {
+        if (mBtnRootToggle == null) return;
+        int color = getResources().getColor(
+            isRoot ? R.color.nt_root_active : R.color.nt_root_inactive, getTheme());
+        mBtnRootToggle.setColorFilter(color);
+    }
+
+    private void insertSpeechTextToTerminal(String text) {
+        if (text == null || text.isEmpty()) return;
+        // Check autocorrect for known command typos
+        String corrected = mAutoCorrectHandler != null
+            ? mAutoCorrectHandler.getCommandCorrection(text) : null;
+        String toInsert = corrected != null ? corrected : text;
+        // Write to the active terminal session
+        TerminalSession session = getCurrentSession();
+        if (session != null) {
+            byte[] bytes = toInsert.getBytes();
+            session.write(bytes, 0, bytes.length);
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+
+    private static final String DRAWER_PREFS = "newtermux_drawer_buttons";
+    private static final String[] DRAWER_BTN_DEFAULT_NAMES = {"Gemini Yolo", "Claude", "", "", ""};
+    private static final String[] DRAWER_BTN_DEFAULT_CMDS  = {
+        "gemini --yolo",
+        "claude --dangerously-skip-permissions",
+        "", "", ""
+    };
+
+    private void setupDrawerCommandButtons() {
+        SharedPreferences prefs = getSharedPreferences(DRAWER_PREFS, MODE_PRIVATE);
+        int count = prefs.getInt("btn_count", DRAWER_BTN_DEFAULT_NAMES.length);
+
+        LinearLayout container = findViewById(R.id.drawer_cmd_container);
+        if (container == null) return;
+        container.removeAllViews();
+
+        int accentColor = NewTermuxTheme.getAccentColor(this);
+        android.content.res.ColorStateList accentCsl =
+            android.content.res.ColorStateList.valueOf(accentColor);
+
+        int marginBtm = Math.round(6 * getResources().getDisplayMetrics().density);
+
+        // --- Utility buttons (always at top, unless toggled off in Settings) ---
+        boolean showExportScript = NewTermuxSettings.isShowDrawerExportScript(this);
+        boolean showPkgUpdate    = NewTermuxSettings.isShowDrawerPkgUpdate(this);
+        boolean anyUtility = showExportScript || showPkgUpdate;
+
+        if (showExportScript) {
+            MaterialButton exportBtn = new MaterialButton(this,
+                null, com.google.android.material.R.attr.materialButtonOutlinedStyle);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.bottomMargin = marginBtm;
+            exportBtn.setLayoutParams(lp);
+            exportBtn.setStrokeColor(accentCsl);
+            exportBtn.setTextColor(accentColor);
+            exportBtn.setText("Exportar pantalla");
+            exportBtn.setOnClickListener(v -> {
+                getDrawer().closeDrawers();
+                mScreenExportSaver.launch("screen.txt");
+            });
+            container.addView(exportBtn);
+
+            MaterialButton scriptBtn = new MaterialButton(this,
+                null, com.google.android.material.R.attr.materialButtonOutlinedStyle);
+            LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp2.bottomMargin = marginBtm;
+            scriptBtn.setLayoutParams(lp2);
+            scriptBtn.setStrokeColor(accentCsl);
+            scriptBtn.setTextColor(accentColor);
+            scriptBtn.setText("Hacer script");
+            scriptBtn.setOnClickListener(v -> {
+                getDrawer().closeDrawers();
+                showMakeScriptDialog();
+            });
+            container.addView(scriptBtn);
+        }
+
+        if (showPkgUpdate) {
+            MaterialButton pkgBtn = new MaterialButton(this,
+                null, com.google.android.material.R.attr.materialButtonOutlinedStyle);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.bottomMargin = marginBtm;
+            pkgBtn.setLayoutParams(lp);
+            pkgBtn.setStrokeColor(accentCsl);
+            pkgBtn.setTextColor(accentColor);
+            pkgBtn.setText("Actualizar paquetes");
+            pkgBtn.setOnClickListener(v -> {
+                getDrawer().closeDrawers();
+                TerminalSession s = getCurrentSession();
+                if (s != null) {
+                    byte[] cmdBytes = "pkg update -y\n".getBytes();
+                    s.write(cmdBytes, 0, cmdBytes.length);
+                }
+            });
+            container.addView(pkgBtn);
+        }
+
+        // Divider between utility and custom buttons
+        if (anyUtility) {
+            android.view.View divider = new android.view.View(this);
+            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, Math.round(1 * getResources().getDisplayMetrics().density));
+            dlp.topMargin = Math.round(2 * getResources().getDisplayMetrics().density);
+            dlp.bottomMargin = marginBtm;
+            divider.setLayoutParams(dlp);
+            divider.setBackgroundColor((accentColor & 0x00FFFFFF) | 0x55000000); // 33% alpha accent
+            container.addView(divider);
+        }
+
+        // --- Custom command buttons ---
+        if (!NewTermuxSettings.isShowDrawerCmdButtons(this)) return;
+        for (int i = 0; i < count; i++) {
+            final int idx = i;
+            String defName = idx < DRAWER_BTN_DEFAULT_NAMES.length ? DRAWER_BTN_DEFAULT_NAMES[idx] : "";
+            String defCmd  = idx < DRAWER_BTN_DEFAULT_CMDS.length  ? DRAWER_BTN_DEFAULT_CMDS[idx]  : "";
+            String name = prefs.getString("btn_" + (i + 1) + "_name", defName);
+            String cmd  = prefs.getString("btn_" + (i + 1) + "_cmd",  defCmd);
+
+            MaterialButton btn = new MaterialButton(this);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.bottomMargin = marginBtm;
+            btn.setLayoutParams(lp);
+            btn.setBackgroundTintList(accentCsl);
+
+            boolean isUnset = name.isEmpty() && cmd.isEmpty();
+            btn.setText(isUnset ? "Mantén pulsado para configurar" : (name.isEmpty() ? "Botón " + (i + 1) : name));
+            if (isUnset) btn.setAlpha(0.5f);
+
+            btn.setOnClickListener(v -> {
+                String c = prefs.getString("btn_" + (idx + 1) + "_cmd",
+                    idx < DRAWER_BTN_DEFAULT_CMDS.length ? DRAWER_BTN_DEFAULT_CMDS[idx] : "");
+                String n = prefs.getString("btn_" + (idx + 1) + "_name",
+                    idx < DRAWER_BTN_DEFAULT_NAMES.length ? DRAWER_BTN_DEFAULT_NAMES[idx] : "");
+                String label = n.isEmpty() ? "Botón " + (idx + 1) : n;
+                if (mTermuxTerminalSessionActivityClient != null) {
+                    mTermuxTerminalSessionActivityClient.addNewSession(false, label);
+                    if (!c.isEmpty()) {
+                        final String finalCmd = c + "\n";
+                        mTerminalView.post(() -> {
+                            TerminalSession s = getCurrentSession();
+                            if (s != null) {
+                                byte[] finalBytes = finalCmd.getBytes();
+                                s.write(finalBytes, 0, finalBytes.length);
+                            }
+                        });
+                    }
+                }
+            });
+            btn.setOnLongClickListener(v -> {
+                showEditDrawerButtonDialog(idx);
+                return true;
+            });
+            container.addView(btn);
+        }
+
+        // +/- controls — apply accent stroke/text color
+        MaterialButton addBtn    = findViewById(R.id.drawer_btn_add);
+        MaterialButton removeBtn = findViewById(R.id.drawer_btn_remove);
+        if (addBtn != null) {
+            addBtn.setStrokeColor(accentCsl);
+            addBtn.setTextColor(accentColor);
+            addBtn.setOnClickListener(v -> {
+                int cur = prefs.getInt("btn_count", DRAWER_BTN_DEFAULT_NAMES.length);
+                if (cur < 10) {
+                    prefs.edit().putInt("btn_count", cur + 1).apply();
+                    setupDrawerCommandButtons();
+                }
+            });
+        }
+        if (removeBtn != null) {
+            removeBtn.setStrokeColor(accentCsl);
+            removeBtn.setTextColor(accentColor);
+            removeBtn.setOnClickListener(v -> {
+                int cur = prefs.getInt("btn_count", DRAWER_BTN_DEFAULT_NAMES.length);
+                if (cur > 1) {
+                    // Clear saved values for the slot being removed so it starts fresh if re-added
+                    prefs.edit()
+                        .remove("btn_" + cur + "_name")
+                        .remove("btn_" + cur + "_cmd")
+                        .putInt("btn_count", cur - 1)
+                        .apply();
+                    setupDrawerCommandButtons();
+                }
+            });
+        }
+    }
+
+    private void showEditDrawerButtonDialog(int idx) {
+        SharedPreferences prefs = getSharedPreferences(DRAWER_PREFS, MODE_PRIVATE);
+        String defName = idx < DRAWER_BTN_DEFAULT_NAMES.length ? DRAWER_BTN_DEFAULT_NAMES[idx] : "";
+        String defCmd  = idx < DRAWER_BTN_DEFAULT_CMDS.length  ? DRAWER_BTN_DEFAULT_CMDS[idx]  : "";
+        String currentName = prefs.getString("btn_" + (idx + 1) + "_name", defName);
+        String currentCmd  = prefs.getString("btn_" + (idx + 1) + "_cmd",  defCmd);
+
+        android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
+        layout.setOrientation(android.widget.LinearLayout.VERTICAL);
+        int pad = Math.round(16 * getResources().getDisplayMetrics().density);
+        layout.setPadding(pad, pad, pad, 0);
+
+        EditText nameField = new EditText(this);
+        nameField.setHint("Etiqueta del botón");
+        nameField.setText(currentName);
+        layout.addView(nameField);
+
+        EditText cmdField = new EditText(this);
+        cmdField.setHint("Comando");
+        cmdField.setText(currentCmd);
+        layout.addView(cmdField);
+
+        new AlertDialog.Builder(this)
+            .setTitle("Editar botón " + (idx + 1))
+            .setView(layout)
+            .setPositiveButton("Guardar", (d, w) -> {
+                String newName = nameField.getText().toString().trim();
+                String newCmd  = cmdField.getText().toString().trim();
+                prefs.edit()
+                    .putString("btn_" + (idx + 1) + "_name", newName)
+                    .putString("btn_" + (idx + 1) + "_cmd",  newCmd)
+                    .apply();
+                setupDrawerCommandButtons();
+            })
+            .setNeutralButton("Restablecer", (d, w) -> {
+                prefs.edit()
+                    .remove("btn_" + (idx + 1) + "_name")
+                    .remove("btn_" + (idx + 1) + "_cmd")
+                    .apply();
+                setupDrawerCommandButtons();
+            })
+            .setNegativeButton("Cancelar", null)
+            .show();
+    }
+
+
+
+
+
+    private void showMakeScriptDialog() {
+        new Thread(() -> {
+            // Try zsh_history first, fall back to bash_history
+            File histFile = new File(TermuxConstants.TERMUX_HOME_DIR_PATH, ".zsh_history");
+            if (!histFile.exists()) histFile = new File(TermuxConstants.TERMUX_HOME_DIR_PATH, ".bash_history");
+            if (!histFile.exists()) {
+                runOnUiThread(() -> Toast.makeText(this, "No se encontró el archivo de historial", Toast.LENGTH_SHORT).show());
+                return;
+            }
+
+            // Parse history: deduplicate, newest-first, cap at 100
+            LinkedHashMap<String, String> seen = new LinkedHashMap<>();
+            try (BufferedReader br = new BufferedReader(new FileReader(histFile))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    // Strip zsh extended format: ": timestamp:elapsed;command"
+                    if (line.startsWith(": ") && line.contains(";")) {
+                        line = line.substring(line.indexOf(';') + 1);
+                    }
+                    line = line.trim();
+                    if (!line.isEmpty()) seen.put(line, line);
+                }
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(this, "Error al leer el historial", Toast.LENGTH_SHORT).show());
+                return;
+            }
+
+            // Reverse so newest entries appear first, cap at 100
+            List<String> entries = new ArrayList<>(seen.values());
+            java.util.Collections.reverse(entries);
+            if (entries.size() > 100) entries = entries.subList(0, 100);
+
+            final List<String> finalEntries = entries;
+            final boolean[] checked = new boolean[finalEntries.size()];
+
+            runOnUiThread(() -> {
+                CharSequence[] items = finalEntries.toArray(new CharSequence[0]);
+                new AlertDialog.Builder(this)
+                    .setTitle("Hacer script — selecciona comandos")
+                    .setMultiChoiceItems(items, checked, (d, which, isChecked) -> checked[which] = isChecked)
+                    .setPositiveButton("Guardar script", (d, w) -> {
+                        // Collect in chronological order (reverse of display order)
+                        List<String> selected = new ArrayList<>();
+                        for (int i = checked.length - 1; i >= 0; i--) {
+                            if (checked[i]) selected.add(finalEntries.get(i));
+                        }
+                        if (selected.isEmpty()) {
+                            Toast.makeText(this, "No se seleccionó ningún comando", Toast.LENGTH_SHORT).show();
+                            return;
+                        }
+                        mPendingScriptLines.clear();
+                        mPendingScriptLines.addAll(selected);
+                        mScriptSaver.launch("script.sh");
+                    })
+                    .setNegativeButton("Cancelar", null)
+                    .show();
+            });
+        }).start();
+    }
+
+    @SuppressLint("RtlHardcoded")
+    @Override
+    public void onBackPressed() {
+        DrawerLayout drawer = getDrawer();
+        if (drawer.isDrawerOpen(Gravity.LEFT) || drawer.isDrawerOpen(Gravity.RIGHT)) {
+            drawer.closeDrawers();
+        } else {
+            finishActivityIfNotFinishing();
+        }
+    }
+
+    public void finishActivityIfNotFinishing() {
+        // prevent duplicate calls to finish() if called from multiple places
+        if (!TermuxActivity.this.isFinishing()) {
+            finish();
+        }
+    }
+
+    /** Show a toast and dismiss the last one if still visible. */
+    public void showToast(String text, boolean longDuration) {
+        if (text == null || text.isEmpty()) return;
+        if (mLastToast != null) mLastToast.cancel();
+        mLastToast = Toast.makeText(TermuxActivity.this, text, longDuration ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT);
+        mLastToast.setGravity(Gravity.TOP, 0, 0);
+        // Bannerlator-style outlined banner for the top-of-screen session-activity notice.
+        float density = getResources().getDisplayMetrics().density;
+        android.widget.TextView tv = new android.widget.TextView(this);
+        tv.setText(text);
+        tv.setTextColor(androidx.core.content.ContextCompat.getColor(this, com.termux.R.color.nt_on_surface));
+        tv.setTextSize(14f);
+        int ph = (int) (20 * density), pv = (int) (12 * density);
+        tv.setPadding(ph, pv, ph, pv);
+        tv.setBackgroundResource(com.termux.R.drawable.bg_popup_menu);
+        mLastToast.setView(tv);
+        mLastToast.show();
+    }
+
+
+
+    /** Wraps a menu title in the live accent color so native popups match the rest of the UI. */
+    private CharSequence accentMenuTitle(CharSequence title) {
+        if (title == null) return null;
+        SpannableString span = new SpannableString(title);
+        span.setSpan(new ForegroundColorSpan(com.newtermux.features.NewTermuxTheme.getAccentColor(this)),
+            0, span.length(), Spanned.SPAN_INCLUSIVE_INCLUSIVE);
+        return span;
+    }
+
+    @Override
+    public void onCreateContextMenu(ContextMenu menu, View v, ContextMenuInfo menuInfo) {
+        TerminalSession currentSession = getCurrentSession();
+        if (currentSession == null) return;
+
+        boolean autoFillEnabled = mTerminalView.isAutoFillEnabled();
+
+        menu.add(Menu.NONE, CONTEXT_MENU_SELECT_URL_ID, Menu.NONE, accentMenuTitle(getString(R.string.action_select_url)));
+        menu.add(Menu.NONE, CONTEXT_MENU_SHARE_TRANSCRIPT_ID, Menu.NONE, accentMenuTitle(getString(R.string.action_share_transcript)));
+        if (!DataUtils.isNullOrEmpty(mTerminalView.getStoredSelectedText()))
+            menu.add(Menu.NONE, CONTEXT_MENU_SHARE_SELECTED_TEXT, Menu.NONE, accentMenuTitle(getString(R.string.action_share_selected_text)));
+        if (autoFillEnabled)
+            menu.add(Menu.NONE, CONTEXT_MENU_AUTOFILL_USERNAME, Menu.NONE, accentMenuTitle(getString(R.string.action_autofill_username)));
+        if (autoFillEnabled)
+            menu.add(Menu.NONE, CONTEXT_MENU_AUTOFILL_PASSWORD, Menu.NONE, accentMenuTitle(getString(R.string.action_autofill_password)));
+        menu.add(Menu.NONE, CONTEXT_MENU_RESET_TERMINAL_ID, Menu.NONE, accentMenuTitle(getString(R.string.action_reset_terminal)));
+        menu.add(Menu.NONE, CONTEXT_MENU_KILL_PROCESS_ID, Menu.NONE,
+            currentSession.isRunning()
+                ? accentMenuTitle(getString(R.string.action_kill_process, currentSession.getPid()))
+                : getString(R.string.action_kill_process, currentSession.getPid()))
+            .setEnabled(currentSession.isRunning());
+        menu.add(Menu.NONE, CONTEXT_MENU_STYLING_ID, Menu.NONE, accentMenuTitle(getString(R.string.action_style_terminal)));
+        menu.add(Menu.NONE, CONTEXT_MENU_TOGGLE_KEEP_SCREEN_ON, Menu.NONE, accentMenuTitle(getString(R.string.action_toggle_keep_screen_on))).setCheckable(true).setChecked(mPreferences.shouldKeepScreenOn());
+        menu.add(Menu.NONE, CONTEXT_MENU_HELP_ID, Menu.NONE, accentMenuTitle(getString(R.string.action_open_help)));
+        menu.add(Menu.NONE, CONTEXT_MENU_SETTINGS_ID, Menu.NONE, accentMenuTitle(getString(R.string.action_open_settings)));
+        menu.add(Menu.NONE, CONTEXT_MENU_REPORT_ID, Menu.NONE, accentMenuTitle(getString(R.string.action_report_issue)));
+    }
+
+    /** Hook system menu to show context menu instead. */
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        mTerminalView.showContextMenu();
+        return false;
+    }
+
+    @Override
+    public boolean onContextItemSelected(MenuItem item) {
+        TerminalSession session = getCurrentSession();
+
+        switch (item.getItemId()) {
+            case CONTEXT_MENU_SELECT_URL_ID:
+                mTermuxTerminalViewClient.showUrlSelection();
+                return true;
+            case CONTEXT_MENU_SHARE_TRANSCRIPT_ID:
+                mTermuxTerminalViewClient.shareSessionTranscript();
+                return true;
+            case CONTEXT_MENU_SHARE_SELECTED_TEXT:
+                mTermuxTerminalViewClient.shareSelectedText();
+                return true;
+            case CONTEXT_MENU_AUTOFILL_USERNAME:
+                mTerminalView.requestAutoFillUsername();
+                return true;
+            case CONTEXT_MENU_AUTOFILL_PASSWORD:
+                mTerminalView.requestAutoFillPassword();
+                return true;
+            case CONTEXT_MENU_RESET_TERMINAL_ID:
+                onResetTerminalSession(session);
+                return true;
+            case CONTEXT_MENU_KILL_PROCESS_ID:
+                showKillSessionDialog(session);
+                return true;
+            case CONTEXT_MENU_STYLING_ID:
+                showStylingDialog();
+                return true;
+            case CONTEXT_MENU_TOGGLE_KEEP_SCREEN_ON:
+                toggleKeepScreenOn();
+                return true;
+            case CONTEXT_MENU_HELP_ID:
+                ActivityUtils.startActivity(this, new Intent(this, HelpActivity.class));
+                return true;
+            case CONTEXT_MENU_SETTINGS_ID:
+                ActivityUtils.startActivity(this, new Intent(this, SettingsActivity.class));
+                return true;
+            case CONTEXT_MENU_REPORT_ID:
+                mTermuxTerminalViewClient.reportIssueFromTranscript();
+                return true;
+            default:
+                return super.onContextItemSelected(item);
+        }
+    }
+
+    @Override
+    public void onContextMenuClosed(Menu menu) {
+        super.onContextMenuClosed(menu);
+        // onContextMenuClosed() is triggered twice if back button is pressed to dismiss instead of tap for some reason
+        mTerminalView.onContextMenuClosed(menu);
+    }
+
+    private void showKillSessionDialog(TerminalSession session) {
+        if (session == null) return;
+
+        final AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setIcon(android.R.drawable.ic_dialog_alert);
+        b.setMessage(R.string.title_confirm_kill_process);
+        b.setPositiveButton(android.R.string.yes, (dialog, id) -> {
+            dialog.dismiss();
+            session.finishIfRunning();
+        });
+        b.setNegativeButton(android.R.string.no, null);
+        b.show();
+    }
+
+    private void onResetTerminalSession(TerminalSession session) {
+        if (session != null) {
+            session.reset();
+            showToast(getResources().getString(R.string.msg_terminal_reset), true);
+
+            if (mTermuxTerminalSessionActivityClient != null)
+                mTermuxTerminalSessionActivityClient.onResetTerminalSession();
+        }
+    }
+
+    private void showStylingDialog() {
+        Intent stylingIntent = new Intent();
+        stylingIntent.setClassName(TermuxConstants.TERMUX_STYLING_PACKAGE_NAME, TermuxConstants.TERMUX_STYLING_APP.TERMUX_STYLING_ACTIVITY_NAME);
+        try {
+            startActivity(stylingIntent);
+        } catch (ActivityNotFoundException | IllegalArgumentException e) {
+            // The startActivity() call is not documented to throw IllegalArgumentException.
+            // However, crash reporting shows that it sometimes does, so catch it here.
+            new AlertDialog.Builder(this).setMessage(getString(R.string.error_styling_not_installed))
+                .setPositiveButton(R.string.action_styling_install,
+                    (dialog, which) -> ActivityUtils.startActivity(this, new Intent(Intent.ACTION_VIEW, Uri.parse(TermuxConstants.TERMUX_STYLING_FDROID_PACKAGE_URL))))
+                .setNegativeButton(android.R.string.cancel, null).show();
+        }
+    }
+    private void toggleKeepScreenOn() {
+        if (mTerminalView.getKeepScreenOn()) {
+            mTerminalView.setKeepScreenOn(false);
+            mPreferences.setKeepScreenOn(false);
+        } else {
+            mTerminalView.setKeepScreenOn(true);
+            mPreferences.setKeepScreenOn(true);
+        }
+    }
+
+
+
+    /**
+     * For processes to access primary external storage (/sdcard, /storage/emulated/0, ~/storage/shared),
+     * termux needs to be granted legacy WRITE_EXTERNAL_STORAGE or MANAGE_EXTERNAL_STORAGE permissions
+     * if targeting targetSdkVersion 30 (android 11) and running on sdk 30 (android 11) and higher.
+     */
+    public void requestStoragePermission(boolean isPermissionCallback) {
+        new Thread() {
+            @Override
+            public void run() {
+                // Do not ask for permission again
+                int requestCode = isPermissionCallback ? -1 : PermissionUtils.REQUEST_GRANT_STORAGE_PERMISSION;
+
+                // If permission is granted, then also setup storage symlinks.
+                if(PermissionUtils.checkAndRequestLegacyOrManageExternalStoragePermission(
+                    TermuxActivity.this, requestCode, !isPermissionCallback)) {
+                    if (isPermissionCallback)
+                        Logger.logInfoAndShowToast(TermuxActivity.this, LOG_TAG,
+                            getString(com.termux.shared.R.string.msg_storage_permission_granted_on_request));
+
+                    TermuxInstaller.setupStorageSymlinks(TermuxActivity.this);
+                } else {
+                    if (isPermissionCallback)
+                        Logger.logInfoAndShowToast(TermuxActivity.this, LOG_TAG,
+                            getString(com.termux.shared.R.string.msg_storage_permission_not_granted_on_request));
+                }
+            }
+        }.start();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        Logger.logVerbose(LOG_TAG, "onActivityResult: requestCode: " + requestCode + ", resultCode: "  + resultCode + ", data: "  + IntentUtils.getIntentString(data));
+        if (!BuildConfig.IS_DEMO && requestCode == PermissionUtils.REQUEST_GRANT_STORAGE_PERMISSION) {
+            requestStoragePermission(true);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        Logger.logVerbose(LOG_TAG, "onRequestPermissionsResult: requestCode: " + requestCode + ", permissions: "  + Arrays.toString(permissions) + ", grantResults: "  + Arrays.toString(grantResults));
+        if (!BuildConfig.IS_DEMO && requestCode == PermissionUtils.REQUEST_GRANT_STORAGE_PERMISSION) {
+            requestStoragePermission(true);
+        } else if (requestCode == REQUEST_RECORD_AUDIO) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                if (mSpeechInputManager != null) mSpeechInputManager.startListening();
+            } else {
+                showToast("Se requiere permiso de micrófono para el dictado por voz", false);
+            }
+        }
+    }
+
+
+
+    public int getNavBarHeight() {
+        return mNavBarHeight;
+    }
+
+    public TermuxActivityRootView getTermuxActivityRootView() {
+        return mTermuxActivityRootView;
+    }
+
+    public View getTermuxActivityBottomSpaceView() {
+        return mTermuxActivityBottomSpaceView;
+    }
+
+    public ExtraKeysView getExtraKeysView() {
+        return mExtraKeysView;
+    }
+
+    public TermuxTerminalExtraKeys getTermuxTerminalExtraKeys() {
+        return mTermuxTerminalExtraKeys;
+    }
+
+    public void setExtraKeysView(ExtraKeysView extraKeysView) {
+        mExtraKeysView = extraKeysView;
+    }
+
+    public DrawerLayout getDrawer() {
+        return (DrawerLayout) findViewById(R.id.drawer_layout);
+    }
+
+
+    public ViewPager getTerminalToolbarViewPager() {
+        return (ViewPager) findViewById(R.id.terminal_toolbar_view_pager);
+    }
+
+    public float getTerminalToolbarDefaultHeight() {
+        return mTerminalToolbarDefaultHeight;
+    }
+
+    public boolean isTerminalViewSelected() {
+        return getTerminalToolbarViewPager().getCurrentItem() == 0;
+    }
+
+    public boolean isTerminalToolbarTextInputViewSelected() {
+        return getTerminalToolbarViewPager().getCurrentItem() == 1;
+    }
+
+
+    public void termuxSessionListNotifyUpdated() {
+        if (mTermuxSessionListViewController != null)
+            mTermuxSessionListViewController.notifyDataSetChanged();
+        updateSessionTabs();
+    }
+
+    public boolean isVisible() {
+        return mIsVisible;
+    }
+
+    public boolean isOnResumeAfterOnCreate() {
+        return mIsOnResumeAfterOnCreate;
+    }
+
+    public boolean isActivityRecreated() {
+        return mIsActivityRecreated;
+    }
+
+
+
+    public TermuxService getTermuxService() {
+        return mTermuxService;
+    }
+
+    public TerminalView getTerminalView() {
+        return mTerminalView;
+    }
+
+    public TermuxTerminalViewClient getTermuxTerminalViewClient() {
+        return mTermuxTerminalViewClient;
+    }
+
+    public TermuxTerminalSessionActivityClient getTermuxTerminalSessionClient() {
+        return mTermuxTerminalSessionActivityClient;
+    }
+
+    @Nullable
+    public TerminalSession getCurrentSession() {
+        if (mTerminalView != null)
+            return mTerminalView.getCurrentSession();
+        else
+            return null;
+    }
+
+    public TermuxAppSharedPreferences getPreferences() {
+        return mPreferences;
+    }
+
+    public TermuxAppSharedProperties getProperties() {
+        return mProperties;
+    }
+
+
+
+
+    public static void updateTermuxActivityStyling(Context context, boolean recreateActivity) {
+        // Make sure that terminal styling is always applied.
+        Intent stylingIntent = new Intent(TERMUX_ACTIVITY.ACTION_RELOAD_STYLE);
+        stylingIntent.putExtra(TERMUX_ACTIVITY.EXTRA_RECREATE_ACTIVITY, recreateActivity);
+        context.sendBroadcast(stylingIntent);
+    }
+
+    private void registerTermuxActivityBroadcastReceiver() {
+        IntentFilter intentFilter = new IntentFilter();
+        intentFilter.addAction(TERMUX_ACTIVITY.ACTION_NOTIFY_APP_CRASH);
+        intentFilter.addAction(TERMUX_ACTIVITY.ACTION_RELOAD_STYLE);
+        intentFilter.addAction(TERMUX_ACTIVITY.ACTION_REQUEST_PERMISSIONS);
+
+        registerReceiver(mTermuxActivityBroadcastReceiver, intentFilter);
+    }
+
+    private void unregisterTermuxActivityBroadcastReceiver() {
+        unregisterReceiver(mTermuxActivityBroadcastReceiver);
+    }
+
+    private void fixTermuxActivityBroadcastReceiverIntent(Intent intent) {
+        if (intent == null) return;
+
+        String extraReloadStyle = intent.getStringExtra(TERMUX_ACTIVITY.EXTRA_RELOAD_STYLE);
+        if ("storage".equals(extraReloadStyle)) {
+            intent.removeExtra(TERMUX_ACTIVITY.EXTRA_RELOAD_STYLE);
+            intent.setAction(TERMUX_ACTIVITY.ACTION_REQUEST_PERMISSIONS);
+        }
+    }
+
+    class TermuxActivityBroadcastReceiver extends BroadcastReceiver {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent == null) return;
+
+            if (mIsVisible) {
+                fixTermuxActivityBroadcastReceiverIntent(intent);
+
+                switch (intent.getAction()) {
+                    case TERMUX_ACTIVITY.ACTION_NOTIFY_APP_CRASH:
+                        Logger.logDebug(LOG_TAG, "Received intent to notify app crash");
+                        TermuxCrashUtils.notifyAppCrashFromCrashLogFile(context, LOG_TAG);
+                        return;
+                    case TERMUX_ACTIVITY.ACTION_RELOAD_STYLE:
+                        Logger.logDebug(LOG_TAG, "Received intent to reload styling");
+                        reloadActivityStyling(intent.getBooleanExtra(TERMUX_ACTIVITY.EXTRA_RECREATE_ACTIVITY, true));
+                        return;
+                    case TERMUX_ACTIVITY.ACTION_REQUEST_PERMISSIONS:
+                        Logger.logDebug(LOG_TAG, "Received intent to request storage permissions");
+                        requestStoragePermission(false);
+                        return;
+                    default:
+                }
+            }
+        }
+    }
+
+    private void reloadActivityStyling(boolean recreateActivity) {
+        if (mProperties != null) {
+            reloadProperties();
+
+            if (mExtraKeysView != null) {
+                mExtraKeysView.setButtonTextAllCaps(mProperties.shouldExtraKeysTextBeAllCaps());
+                mExtraKeysView.reload(mTermuxTerminalExtraKeys.getExtraKeysInfo(), mTerminalToolbarDefaultHeight);
+            }
+
+            // Update NightMode.APP_NIGHT_MODE
+            TermuxThemeUtils.setAppNightMode(mProperties.getNightMode());
+        }
+
+        setMargins();
+        setTerminalToolbarHeight();
+
+        FileReceiverActivity.updateFileReceiverActivityComponentsState(this);
+
+        if (mTermuxTerminalSessionActivityClient != null)
+            mTermuxTerminalSessionActivityClient.onReloadActivityStyling();
+
+        if (mTermuxTerminalViewClient != null)
+            mTermuxTerminalViewClient.onReloadActivityStyling();
+
+        // To change the activity and drawer theme, activity needs to be recreated.
+        // It will destroy the activity, including all stored variables and views, and onCreate()
+        // will be called again. Extra keys input text, terminal sessions and transcripts will be preserved.
+        if (recreateActivity) {
+            Logger.logDebug(LOG_TAG, "Recreating activity");
+            TermuxActivity.this.recreate();
+        }
+    }
+
+
+
+    public static void startTermuxActivity(@NonNull final Context context) {
+        ActivityUtils.startActivity(context, newInstance(context));
+    }
+
+    public static Intent newInstance(@NonNull final Context context) {
+        Intent intent = new Intent(context, TermuxActivity.class);
+        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        return intent;
+    }
+
+}

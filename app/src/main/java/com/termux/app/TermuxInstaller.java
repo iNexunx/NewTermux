@@ -1,0 +1,738 @@
+package com.termux.app;
+
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.ProgressDialog;
+import android.content.Context;
+import android.os.Build;
+import android.os.Environment;
+import android.system.Os;
+import android.util.Pair;
+import android.view.WindowManager;
+
+import com.termux.BuildConfig;
+import com.termux.R;
+import com.termux.shared.file.FileUtils;
+import com.termux.shared.termux.crash.TermuxCrashUtils;
+import com.termux.shared.termux.file.TermuxFileUtils;
+import com.termux.shared.interact.MessageDialogUtils;
+import com.termux.shared.logger.Logger;
+import com.termux.shared.markdown.MarkdownUtils;
+import com.termux.shared.errors.Error;
+import com.termux.shared.android.PackageUtils;
+import com.termux.shared.termux.TermuxConstants;
+import com.termux.shared.termux.TermuxUtils;
+import com.termux.shared.termux.shell.command.environment.TermuxShellEnvironment;
+
+
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+
+import static com.termux.shared.termux.TermuxConstants.TERMUX_PREFIX_DIR;
+import static com.termux.shared.termux.TermuxConstants.TERMUX_PREFIX_DIR_PATH;
+import static com.termux.shared.termux.TermuxConstants.TERMUX_STAGING_PREFIX_DIR;
+import static com.termux.shared.termux.TermuxConstants.TERMUX_STAGING_PREFIX_DIR_PATH;
+
+/**
+ * Install the Termux bootstrap packages if necessary by following the below steps:
+ * <p/>
+ * (1) If $PREFIX already exist, assume that it is correct and be done. Note that this relies on that we do not create a
+ * broken $PREFIX directory below.
+ * <p/>
+ * (2) A progress dialog is shown with "Installing..." message and a spinner.
+ * <p/>
+ * (3) A staging directory, $STAGING_PREFIX, is cleared if left over from broken installation below.
+ * <p/>
+ * (4) The zip file is loaded from a shared library.
+ * <p/>
+ * (5) The zip, containing entries relative to the $PREFIX, is is downloaded and extracted by a zip input stream
+ * continuously encountering zip file entries:
+ * <p/>
+ * (5.1) If the zip entry encountered is SYMLINKS.txt, go through it and remember all symlinks to setup.
+ * <p/>
+ * (5.2) For every other zip entry, extract it into $STAGING_PREFIX and set execute permissions if necessary.
+ */
+public final class TermuxInstaller {
+
+    private static final String LOG_TAG = "TermuxInstaller";
+
+    private static final String DEMO_SHELL_SCRIPT =
+        "#!/system/bin/sh\n" +
+        "clear\n" +
+        "echo ''\n" +
+        "echo '  ╔══════════════════════════════════════════╗'\n" +
+        "echo '  ║      NewTermux — Test / Coexist Mode     ║'\n" +
+        "echo '  ║  Settings, toolbar & UI are fully live.  ║'\n" +
+        "echo '  ║  Shell commands are disabled here.       ║'\n" +
+        "echo '  ╚══════════════════════════════════════════╝'\n" +
+        "echo ''\n" +
+        "while true; do\n" +
+        "  printf '$ '\n" +
+        "  read line\n" +
+        "  [ -n \"$line\" ] && echo \"[test-mode] $line\"\n" +
+        "done\n";
+
+    /** Performs bootstrap setup if necessary. */
+    static void setupBootstrapIfNeeded(final Activity activity, final Runnable whenDone) {
+        // Demo/coexist build: skip the real bootstrap. Write a fake interactive shell to the
+        // demo package's own files dir (the only dir we can write to) and proceed.
+        if (BuildConfig.IS_DEMO) {
+            new Thread() {
+                @Override
+                public void run() {
+                    try {
+                        File binDir = new File(activity.getFilesDir(), "bin");
+                        binDir.mkdirs();
+                        File fakeShell = new File(binDir, "bash");
+                        try (FileOutputStream fos = new FileOutputStream(fakeShell)) {
+                            fos.write(DEMO_SHELL_SCRIPT.getBytes(StandardCharsets.UTF_8));
+                        }
+                        Os.chmod(fakeShell.getAbsolutePath(), 0755);
+                    } catch (Exception e) {
+                        Logger.logError(LOG_TAG, "Demo shell setup failed: " + e.getMessage());
+                    }
+                    activity.runOnUiThread(whenDone);
+                }
+            }.start();
+            return;
+        }
+
+        String bootstrapErrorMessage;
+        Error filesDirectoryAccessibleError;
+
+        // This will also call Context.getFilesDir(), which should ensure that termux files directory
+        // is created if it does not already exist
+        filesDirectoryAccessibleError = TermuxFileUtils.isTermuxFilesDirectoryAccessible(activity, true, true);
+        boolean isFilesDirectoryAccessible = filesDirectoryAccessibleError == null;
+
+        // Termux can only be run as the primary user (device owner) since only that
+        // account has the expected file system paths. Verify that:
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && !PackageUtils.isCurrentUserThePrimaryUser(activity)) {
+            bootstrapErrorMessage = activity.getString(R.string.bootstrap_error_not_primary_user_message,
+                MarkdownUtils.getMarkdownCodeForString(TERMUX_PREFIX_DIR_PATH, false));
+            Logger.logError(LOG_TAG, "isFilesDirectoryAccessible: " + isFilesDirectoryAccessible);
+            Logger.logError(LOG_TAG, bootstrapErrorMessage);
+            sendBootstrapCrashReportNotification(activity, bootstrapErrorMessage);
+            MessageDialogUtils.exitAppWithErrorMessage(activity,
+                activity.getString(R.string.bootstrap_error_title),
+                bootstrapErrorMessage);
+            return;
+        }
+
+        if (!isFilesDirectoryAccessible) {
+            bootstrapErrorMessage = Error.getMinimalErrorString(filesDirectoryAccessibleError);
+            //noinspection SdCardPath
+            if (PackageUtils.isAppInstalledOnExternalStorage(activity) &&
+                !TermuxConstants.TERMUX_FILES_DIR_PATH.equals(activity.getFilesDir().getAbsolutePath().replaceAll("^/data/user/0/", "/data/data/"))) {
+                bootstrapErrorMessage += "\n\n" + activity.getString(R.string.bootstrap_error_installed_on_portable_sd,
+                    MarkdownUtils.getMarkdownCodeForString(TERMUX_PREFIX_DIR_PATH, false));
+            }
+
+            Logger.logError(LOG_TAG, bootstrapErrorMessage);
+            sendBootstrapCrashReportNotification(activity, bootstrapErrorMessage);
+            MessageDialogUtils.showMessage(activity,
+                activity.getString(R.string.bootstrap_error_title),
+                bootstrapErrorMessage, null);
+            return;
+        }
+
+        // If prefix directory exists, even if its a symlink to a valid directory and symlink is not broken/dangling
+        if (FileUtils.directoryFileExists(TERMUX_PREFIX_DIR_PATH, true)) {
+            if (TermuxFileUtils.isTermuxPrefixDirectoryEmpty()) {
+                Logger.logInfo(LOG_TAG, "The termux prefix directory \"" + TERMUX_PREFIX_DIR_PATH + "\" exists but is empty or only contains specific unimportant files.");
+            } else {
+                whenDone.run();
+                return;
+            }
+        } else if (FileUtils.fileExists(TERMUX_PREFIX_DIR_PATH, false)) {
+            Logger.logInfo(LOG_TAG, "The termux prefix directory \"" + TERMUX_PREFIX_DIR_PATH + "\" does not exist but another file exists at its destination.");
+        }
+
+        final ProgressDialog progress = ProgressDialog.show(activity, null, activity.getString(R.string.bootstrap_installer_body), true, false);
+        new Thread() {
+            @Override
+            public void run() {
+                try {
+                    Logger.logInfo(LOG_TAG, "Installing " + TermuxConstants.TERMUX_APP_NAME + " bootstrap packages.");
+
+                    Error error;
+
+                    // Delete prefix staging directory or any file at its destination
+                    error = FileUtils.deleteFile("termux prefix staging directory", TERMUX_STAGING_PREFIX_DIR_PATH, true);
+                    if (error != null) {
+                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
+                        return;
+                    }
+
+                    // Delete prefix directory or any file at its destination
+                    error = FileUtils.deleteFile("termux prefix directory", TERMUX_PREFIX_DIR_PATH, true);
+                    if (error != null) {
+                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
+                        return;
+                    }
+
+                    // Create prefix staging directory if it does not already exist and set required permissions
+                    error = TermuxFileUtils.isTermuxPrefixStagingDirectoryAccessible(true, true);
+                    if (error != null) {
+                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
+                        return;
+                    }
+
+                    // Create prefix directory if it does not already exist and set required permissions
+                    error = TermuxFileUtils.isTermuxPrefixDirectoryAccessible(true, true);
+                    if (error != null) {
+                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
+                        return;
+                    }
+
+                    Logger.logInfo(LOG_TAG, "Extracting bootstrap zip to prefix staging directory \"" + TERMUX_STAGING_PREFIX_DIR_PATH + "\".");
+
+                    final byte[] buffer = new byte[8096];
+                    final List<Pair<String, String>> symlinks = new ArrayList<>(50);
+
+                    final byte[] zipBytes = loadZipBytes();
+                    try (ZipInputStream zipInput = new ZipInputStream(new ByteArrayInputStream(zipBytes))) {
+                        ZipEntry zipEntry;
+                        while ((zipEntry = zipInput.getNextEntry()) != null) {
+                            if (zipEntry.getName().equals("SYMLINKS.txt")) {
+                                BufferedReader symlinksReader = new BufferedReader(new InputStreamReader(zipInput));
+                                String line;
+                                while ((line = symlinksReader.readLine()) != null) {
+                                    String[] parts = line.split("←");
+                                    if (parts.length != 2)
+                                        throw new RuntimeException("Malformed symlink line: " + line);
+                                    String oldPath = parts[0];
+                                    String newPath = TERMUX_STAGING_PREFIX_DIR_PATH + "/" + parts[1];
+                                    symlinks.add(Pair.create(oldPath, newPath));
+
+                                    error = ensureDirectoryExists(new File(newPath).getParentFile());
+                                    if (error != null) {
+                                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
+                                        return;
+                                    }
+                                }
+                            } else {
+                                String zipEntryName = zipEntry.getName();
+                                File targetFile = new File(TERMUX_STAGING_PREFIX_DIR_PATH, zipEntryName);
+                                boolean isDirectory = zipEntry.isDirectory();
+
+                                error = ensureDirectoryExists(isDirectory ? targetFile : targetFile.getParentFile());
+                                if (error != null) {
+                                    showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
+                                    return;
+                                }
+
+                                if (!isDirectory) {
+                                    try (FileOutputStream outStream = new FileOutputStream(targetFile)) {
+                                        int readBytes;
+                                        while ((readBytes = zipInput.read(buffer)) != -1)
+                                            outStream.write(buffer, 0, readBytes);
+                                    }
+                                    if (zipEntryName.startsWith("bin/") || zipEntryName.startsWith("libexec/") ||
+                                        zipEntryName.startsWith("usr/bin/") || zipEntryName.startsWith("usr/libexec/") ||
+                                        zipEntryName.startsWith("lib/apt/apt-helper") || zipEntryName.startsWith("lib/apt/methods")) {
+                                        //noinspection OctalInteger
+                                        Os.chmod(targetFile.getAbsolutePath(), 0700);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (symlinks.isEmpty())
+                        throw new RuntimeException("No SYMLINKS.txt encountered");
+                    for (Pair<String, String> symlink : symlinks) {
+                        Os.symlink(symlink.first, symlink.second);
+                    }
+
+                    Logger.logInfo(LOG_TAG, "Moving termux prefix staging to prefix directory.");
+
+                    if (!TERMUX_STAGING_PREFIX_DIR.renameTo(TERMUX_PREFIX_DIR)) {
+                        throw new RuntimeException("Moving termux prefix staging to prefix directory failed");
+                    }
+
+                    Logger.logInfo(LOG_TAG, "Bootstrap packages installed successfully.");
+
+                    // Run the termux bootstrap second stage from the app and log its output to
+                    // logcat only, then delete the bootstrap's profile.d fallback hook so that
+                    // the "Starting fallback run of termux bootstrap second stage" message never
+                    // appears in the shell console.
+                    runBootstrapSecondStage();
+
+                    // Recreate env file since termux prefix was wiped earlier
+                    TermuxShellEnvironment.writeEnvironmentToFile(activity);
+
+                    // Step 6: Extract bundled zsh plugins only. ~/.zshrc and the default
+                    // shell are left untouched so the console keeps the user's own design.
+                    installZshPlugins(activity);
+
+                    // Hide the bootstrap/motd on the first prompt by creating an empty
+                    // ~/.hushlogin so the console opens clean in the second stage.
+                    createHushLogin(activity);
+
+                    activity.runOnUiThread(whenDone);
+
+                } catch (final Exception e) {
+                    showBootstrapErrorDialog(activity, whenDone, Logger.getStackTracesMarkdownString(null, Logger.getStackTracesStringArray(e)));
+
+                } finally {
+                    activity.runOnUiThread(() -> {
+                        try {
+                            progress.dismiss();
+                        } catch (RuntimeException e) {
+                            // Activity already dismissed - ignore.
+                        }
+                    });
+                }
+            }
+        }.start();
+    }
+
+    private static final String BOOTSTRAP_SECOND_STAGE_SCRIPT_REL_PATH =
+        "etc/termux/termux-bootstrap/second-stage/termux-bootstrap-second-stage.sh";
+    private static final String BOOTSTRAP_SECOND_STAGE_FALLBACK_REL_PATH =
+        "etc/profile.d/01-termux-bootstrap-second-stage-fallback.sh";
+
+    /**
+     * Run the termux bootstrap second stage from the app (instead of letting the
+     * profile.d fallback hook print messages into the shell console on first login).
+     *
+     * After the bootstrap prefix is in place, this executes the bootstrap shipped
+     * {@code termux-bootstrap-second-stage.sh} with the prefix {@code bash},
+     * capturing its output to logcat only. It then deletes the bootstrap's
+     * {@code 01-termux-bootstrap-second-stage-fallback.sh} profile.d hook so that
+     * "Starting fallback run of termux bootstrap second stage" never appears in the
+     * terminal console. If the stage script is missing (older bootstrap), this is a no-op.
+     */
+    private static void runBootstrapSecondStage() {
+        final String prefixPath = TERMUX_PREFIX_DIR_PATH;
+        final File stageScript = new File(prefixPath, BOOTSTRAP_SECOND_STAGE_SCRIPT_REL_PATH);
+        final File fallbackScript = new File(prefixPath, BOOTSTRAP_SECOND_STAGE_FALLBACK_REL_PATH);
+        final File bash = new File(prefixPath, "bin/bash");
+
+        // A bootstrap without the second stage support does not need handling.
+        if (!stageScript.isFile() || !bash.isFile()) {
+            if (fallbackScript.exists()) {
+                Logger.logInfo(LOG_TAG, "Deleting termux bootstrap second stage fallback profile.d hook at \"" + fallbackScript.getAbsolutePath() + "\".");
+                fallbackScript.delete();
+            }
+            return;
+        }
+
+        final File homeDir = TermuxConstants.TERMUX_HOME_DIR;
+        if (!homeDir.exists()) homeDir.mkdirs();
+
+        Logger.logInfo(LOG_TAG, "Running termux bootstrap second stage from app with output logged to logcat.");
+        try {
+            ProcessBuilder pb = new ProcessBuilder(bash.getAbsolutePath(), stageScript.getAbsolutePath());
+            pb.environment().put("TERMUX_PREFIX", prefixPath);
+            pb.environment().put("TERMUX_PACKAGE_MANAGER", "apt");
+            pb.environment().put("TERMUX_PACKAGE_ARCH", getBootstrapArch());
+            pb.environment().put("PATH", prefixPath + "/bin:/system/bin:/vendor/bin:" +
+                java.lang.System.getenv("PATH"));
+            pb.environment().put("HOME", homeDir.getAbsolutePath());
+            pb.environment().put("TMPDIR", prefixPath + "/tmp");
+            pb.environment().put("LD_LIBRARY_PATH", prefixPath + "/lib");
+            pb.environment().put("TERMUX__UID", String.valueOf(android.os.Process.myUid()));
+            pb.environment().put("ANDROID__BUILD_VERSION_SDK", Integer.toString(Build.VERSION.SDK_INT));
+            pb.redirectErrorStream(true);
+
+            Process process = pb.start();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null)
+                    Logger.logInfo(LOG_TAG, "termux-bootstrap-second-stage: " + line);
+            }
+            int exitCode = process.waitFor();
+            Logger.logInfo(LOG_TAG, "Termux bootstrap second stage exited with code " + exitCode + ".");
+        } catch (Exception e) {
+            Logger.logError(LOG_TAG, "Failed to run termux bootstrap second stage: " + e.getMessage());
+        } finally {
+            // Never let the fallback print its message into the shell console.
+            if (fallbackScript.exists()) {
+                Logger.logInfo(LOG_TAG, "Deleting termux bootstrap second stage fallback profile.d hook at \"" + fallbackScript.getAbsolutePath() + "\".");
+                fallbackScript.delete();
+            }
+        }
+    }
+
+    /** Return the termux-packages style architecture name used by the second stage script. */
+    private static String getBootstrapArch() {
+        String abi = (Build.SUPPORTED_ABIS != null && Build.SUPPORTED_ABIS.length > 0)
+            ? Build.SUPPORTED_ABIS[0] : "arm64-v8a";
+        switch (abi) {
+            case "armeabi-v7a": return "arm";
+            case "x86":         return "i686";
+            case "x86_64":      return "x86_64";
+            case "arm64-v8a":
+            default:            return "aarch64";
+        }
+    }
+
+    public static void showBootstrapErrorDialog(Activity activity, Runnable whenDone, String message) {
+        Logger.logErrorExtended(LOG_TAG, "Bootstrap Error:\n" + message);
+
+        // Send a notification with the exception so that the user knows why bootstrap setup failed
+        sendBootstrapCrashReportNotification(activity, message);
+
+        activity.runOnUiThread(() -> {
+            try {
+                new AlertDialog.Builder(activity).setTitle(R.string.bootstrap_error_title).setMessage(R.string.bootstrap_error_body)
+                    .setNegativeButton(R.string.bootstrap_error_abort, (dialog, which) -> {
+                        dialog.dismiss();
+                        activity.finish();
+                    })
+                    .setPositiveButton(R.string.bootstrap_error_try_again, (dialog, which) -> {
+                        dialog.dismiss();
+                        FileUtils.deleteFile("termux prefix directory", TERMUX_PREFIX_DIR_PATH, true);
+                        TermuxInstaller.setupBootstrapIfNeeded(activity, whenDone);
+                    }).show();
+            } catch (WindowManager.BadTokenException e1) {
+                // Activity already dismissed - ignore.
+            }
+        });
+    }
+
+    private static void sendBootstrapCrashReportNotification(Activity activity, String message) {
+        final String title = TermuxConstants.TERMUX_APP_NAME + " Bootstrap Error";
+
+        // Add info of all install Termux plugin apps as well since their target sdk or installation
+        // on external/portable sd card can affect Termux app files directory access or exec.
+        TermuxCrashUtils.sendCrashReportNotification(activity, LOG_TAG,
+            title, null, "## " + title + "\n\n" + message + "\n\n" +
+                TermuxUtils.getTermuxDebugMarkdownString(activity),
+            true, false, TermuxUtils.AppInfoMode.TERMUX_AND_PLUGIN_PACKAGES, true);
+    }
+
+    static void setupStorageSymlinks(final Context context) {
+        final String LOG_TAG = "termux-storage";
+        final String title = TermuxConstants.TERMUX_APP_NAME + " Setup Storage Error";
+
+        Logger.logInfo(LOG_TAG, "Setting up storage symlinks.");
+
+        new Thread() {
+            public void run() {
+                try {
+                    Error error;
+                    File storageDir = TermuxConstants.TERMUX_STORAGE_HOME_DIR;
+
+                    error = FileUtils.clearDirectory("~/storage", storageDir.getAbsolutePath());
+                    if (error != null) {
+                        Logger.logErrorAndShowToast(context, LOG_TAG, error.getMessage());
+                        Logger.logErrorExtended(LOG_TAG, "Setup Storage Error\n" + error.toString());
+                        TermuxCrashUtils.sendCrashReportNotification(context, LOG_TAG, title, null,
+                            "## " + title + "\n\n" + Error.getErrorMarkdownString(error),
+                            true, false, TermuxUtils.AppInfoMode.TERMUX_PACKAGE, true);
+                        return;
+                    }
+
+                    Logger.logInfo(LOG_TAG, "Setting up storage symlinks at ~/storage/shared, ~/storage/downloads, ~/storage/dcim, ~/storage/pictures, ~/storage/music and ~/storage/movies for directories in \"" + Environment.getExternalStorageDirectory().getAbsolutePath() + "\".");
+
+                    // Get primary storage root "/storage/emulated/0" symlink
+                    File sharedDir = Environment.getExternalStorageDirectory();
+                    Os.symlink(sharedDir.getAbsolutePath(), new File(storageDir, "shared").getAbsolutePath());
+
+                    File documentsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS);
+                    Os.symlink(documentsDir.getAbsolutePath(), new File(storageDir, "documents").getAbsolutePath());
+
+                    File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                    Os.symlink(downloadsDir.getAbsolutePath(), new File(storageDir, "downloads").getAbsolutePath());
+
+                    File dcimDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM);
+                    Os.symlink(dcimDir.getAbsolutePath(), new File(storageDir, "dcim").getAbsolutePath());
+
+                    File picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES);
+                    Os.symlink(picturesDir.getAbsolutePath(), new File(storageDir, "pictures").getAbsolutePath());
+
+                    File musicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC);
+                    Os.symlink(musicDir.getAbsolutePath(), new File(storageDir, "music").getAbsolutePath());
+
+                    File moviesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES);
+                    Os.symlink(moviesDir.getAbsolutePath(), new File(storageDir, "movies").getAbsolutePath());
+
+                    File podcastsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PODCASTS);
+                    Os.symlink(podcastsDir.getAbsolutePath(), new File(storageDir, "podcasts").getAbsolutePath());
+
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        File audiobooksDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_AUDIOBOOKS);
+                        Os.symlink(audiobooksDir.getAbsolutePath(), new File(storageDir, "audiobooks").getAbsolutePath());
+                    }
+
+                    // Dir 0 should ideally be for primary storage
+                    // https://cs.android.com/android/platform/superproject/+/android-12.0.0_r32:frameworks/base/core/java/android/app/ContextImpl.java;l=818
+                    // https://cs.android.com/android/platform/superproject/+/android-12.0.0_r32:frameworks/base/core/java/android/os/Environment.java;l=219
+                    // https://cs.android.com/android/platform/superproject/+/android-12.0.0_r32:frameworks/base/core/java/android/os/Environment.java;l=181
+                    // https://cs.android.com/android/platform/superproject/+/android-12.0.0_r32:frameworks/base/services/core/java/com/android/server/StorageManagerService.java;l=3796
+                    // https://cs.android.com/android/platform/superproject/+/android-7.0.0_r36:frameworks/base/services/core/java/com/android/server/MountService.java;l=3053
+
+                    // Create "Android/data/com.termux" symlinks
+                    File[] dirs = context.getExternalFilesDirs(null);
+                    if (dirs != null && dirs.length > 0) {
+                        for (int i = 0; i < dirs.length; i++) {
+                            File dir = dirs[i];
+                            if (dir == null) continue;
+                            String symlinkName = "external-" + i;
+                            Logger.logInfo(LOG_TAG, "Setting up storage symlinks at ~/storage/" + symlinkName + " for \"" + dir.getAbsolutePath() + "\".");
+                            Os.symlink(dir.getAbsolutePath(), new File(storageDir, symlinkName).getAbsolutePath());
+                        }
+                    }
+
+                    // Create "Android/media/com.termux" symlinks
+                    dirs = context.getExternalMediaDirs();
+                    if (dirs != null && dirs.length > 0) {
+                        for (int i = 0; i < dirs.length; i++) {
+                            File dir = dirs[i];
+                            if (dir == null) continue;
+                            String symlinkName = "media-" + i;
+                            Logger.logInfo(LOG_TAG, "Setting up storage symlinks at ~/storage/" + symlinkName + " for \"" + dir.getAbsolutePath() + "\".");
+                            Os.symlink(dir.getAbsolutePath(), new File(storageDir, symlinkName).getAbsolutePath());
+                        }
+                    }
+
+                    Logger.logInfo(LOG_TAG, "Storage symlinks created successfully.");
+                } catch (Exception e) {
+                    Logger.logErrorAndShowToast(context, LOG_TAG, e.getMessage());
+                    Logger.logStackTraceWithMessage(LOG_TAG, "Setup Storage Error: Error setting up link", e);
+                    TermuxCrashUtils.sendCrashReportNotification(context, LOG_TAG, title, null,
+                        "## " + title + "\n\n" + Logger.getStackTracesMarkdownString(null, Logger.getStackTracesStringArray(e)),
+                        true, false, TermuxUtils.AppInfoMode.TERMUX_PACKAGE, true);
+                }
+            }
+        }.start();
+    }
+
+    // The plugin configuration lives in a clearly marked block so that enabling or
+    // disabling the shell enhancements never rewrites the rest of ~/.zshrc.
+    private static final String ZSH_BLOCK_BEGIN = "# >>> NewTermux shell enhancements >>>";
+    private static final String ZSH_BLOCK_END = "# <<< NewTermux shell enhancements <<<";
+    private static final String AUTOSUGGESTIONS_LINE =
+        "source ~/.zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh";
+    private static final String SYNTAX_HL_LINE =
+        "source ~/.zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh";
+
+    /**
+     * Extract the bundled zsh plugins into ~/.zsh/plugins.
+     *
+     * This intentionally does not create or modify ~/.zshrc and does not change the
+     * user's default shell, so the console keeps whatever look the user already has.
+     * The plugins are only sourced once the user explicitly enables the shell
+     * enhancements from Settings.
+     */
+    public static void installZshPlugins(Context context) {
+        File pluginsDir = new File(TermuxConstants.TERMUX_HOME_DIR_PATH, ".zsh/plugins");
+        if (!pluginsDir.exists()) pluginsDir.mkdirs();
+
+        Logger.logInfo(LOG_TAG, "Extracting bundled zsh plugins...");
+        try (ZipInputStream zip = new ZipInputStream(context.getAssets().open("zsh-plugins.zip"))) {
+            ZipEntry entry;
+            byte[] buf = new byte[8096];
+            while ((entry = zip.getNextEntry()) != null) {
+                String name = entry.getName();
+                // Strip "zsh-plugins/" prefix → files land in ~/.zsh/plugins/
+                if (name.startsWith("zsh-plugins/")) name = name.substring("zsh-plugins/".length());
+                if (name.isEmpty()) continue;
+                File target = new File(pluginsDir, name);
+                if (entry.isDirectory()) {
+                    target.mkdirs();
+                } else {
+                    target.getParentFile().mkdirs();
+                    try (FileOutputStream fos = new FileOutputStream(target)) {
+                        int n;
+                        while ((n = zip.read(buf)) != -1) fos.write(buf, 0, n);
+                    }
+                }
+            }
+            Logger.logInfo(LOG_TAG, "Zsh plugins extracted successfully.");
+        } catch (Exception e) {
+            Logger.logError(LOG_TAG, "Failed to extract zsh plugins: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Enable/disable the bundled zsh shell enhancements.
+     *
+     * An existing ~/.zshrc is never overwritten: the source lines are appended inside
+     * a marked block and disabling removes only that block. The file is created only
+     * when the user explicitly enables the feature and has no ~/.zshrc yet.
+     */
+    public static void setZshPlugins(Context context, boolean enable) {
+        installZshPlugins(context);
+        File zshrc = new File(TermuxConstants.TERMUX_HOME_DIR_PATH, ".zshrc");
+        if (enable) {
+            appendZshBlock(zshrc);
+            setZshAsDefaultShell();
+        } else {
+            removeZshBlock(zshrc);
+        }
+    }
+
+    private static String buildZshBlock() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(ZSH_BLOCK_BEGIN).append("\n");
+        sb.append(AUTOSUGGESTIONS_LINE).append("\n");
+        // PowerShell-inspired syntax highlight styles (must be set before sourcing the plugin)
+        sb.append("# Syntax highlight styles — PowerShell-inspired\n");
+        sb.append("typeset -A ZSH_HIGHLIGHT_STYLES\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[command]='fg=green,bold'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[alias]='fg=green,bold'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[builtin]='fg=blue,bold'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[function]='fg=green'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[precommand]='fg=cyan,bold'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[single-hyphen-option]='fg=cyan'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[double-hyphen-option]='fg=cyan'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[path]='fg=blue'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[globbing]='fg=magenta'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[single-quoted-argument]='fg=yellow'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[double-quoted-argument]='fg=yellow'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[assign]='fg=cyan'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[comment]='fg=8'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[unknown-token]='fg=red,bold'\n");
+        sb.append("ZSH_HIGHLIGHT_STYLES[default]='fg=white'\n");
+        // zsh-syntax-highlighting must be sourced last.
+        sb.append(SYNTAX_HL_LINE).append("\n");
+        sb.append(ZSH_BLOCK_END).append("\n");
+        return sb.toString();
+    }
+
+    /** Remove a previously written marked block, leaving all other content intact. */
+    private static String stripZshBlock(String content) {
+        int begin = content.indexOf(ZSH_BLOCK_BEGIN);
+        if (begin < 0) return content;
+        int end = content.indexOf(ZSH_BLOCK_END, begin);
+        if (end < 0) return content;
+        end += ZSH_BLOCK_END.length();
+        if (end < content.length() && content.charAt(end) == '\n') end++;
+        return content.substring(0, begin) + content.substring(end);
+    }
+
+    private static void appendZshBlock(File zshrc) {
+        try {
+            String content;
+            if (zshrc.exists()) {
+                content = stripZshBlock(new String(java.nio.file.Files.readAllBytes(zshrc.toPath()), StandardCharsets.UTF_8));
+                if (!content.isEmpty() && !content.endsWith("\n")) content = content + "\n";
+            } else {
+                // First-time opt-in: set a Termux-like prompt so the console does not open
+                // with zsh's bare "%" default prompt.
+                content = "PROMPT_EOL_MARK=''\nPS1='%n@%m:%~$ '\n";
+            }
+            content = content + buildZshBlock();
+            java.nio.file.Files.write(zshrc.toPath(), content.getBytes(StandardCharsets.UTF_8));
+            Logger.logInfo(LOG_TAG, "Enabled zsh shell enhancements in ~/.zshrc.");
+        } catch (Exception e) {
+            Logger.logError(LOG_TAG, "Failed to enable zsh shell enhancements: " + e.getMessage());
+        }
+    }
+
+    private static void removeZshBlock(File zshrc) {
+        if (!zshrc.exists()) return;
+        try {
+            String content = new String(java.nio.file.Files.readAllBytes(zshrc.toPath()), StandardCharsets.UTF_8);
+            String stripped = stripZshBlock(content);
+            if (!stripped.equals(content)) {
+                java.nio.file.Files.write(zshrc.toPath(), stripped.getBytes(StandardCharsets.UTF_8));
+                Logger.logInfo(LOG_TAG, "Disabled zsh shell enhancements in ~/.zshrc.");
+            }
+        } catch (Exception e) {
+            Logger.logError(LOG_TAG, "Failed to disable zsh shell enhancements: " + e.getMessage());
+        }
+    }
+
+    private static void setZshAsDefaultShell() {
+        try {
+            File termuxDir = new File(TermuxConstants.TERMUX_HOME_DIR_PATH, ".termux");
+            if (!termuxDir.exists()) termuxDir.mkdirs();
+            File shellLink = new File(termuxDir, "shell");
+            File zshBin = new File(TERMUX_PREFIX_DIR_PATH, "bin/zsh");
+            if (zshBin.exists() && !shellLink.exists()) {
+                Os.symlink(zshBin.getAbsolutePath(), shellLink.getAbsolutePath());
+                Logger.logInfo(LOG_TAG, "Set zsh as default shell via ~/.termux/shell.");
+            }
+        } catch (Exception e) {
+            Logger.logError(LOG_TAG, "Failed to set zsh as default shell: " + e.getMessage());
+        }
+    }
+
+    private static Error ensureDirectoryExists(File directory) {
+        return FileUtils.createDirectoryFile(directory.getAbsolutePath());
+    }
+
+    /** Create an empty ~/.hushlogin so the second stage opens a clean, MOTD-free console. */
+    private static void createHushLogin(Context context) {
+        try {
+            File homeDir = TermuxConstants.TERMUX_HOME_DIR;
+            if (!homeDir.exists()) homeDir.mkdirs();
+            File hushLogin = new File(homeDir, ".hushlogin");
+            if (!hushLogin.exists()) {
+                try (FileOutputStream fos = new FileOutputStream(hushLogin)) {
+                    // Empty file.
+                }
+                Logger.logInfo(LOG_TAG, "Created ~/.hushlogin.");
+            }
+        } catch (Exception e) {
+            Logger.logError(LOG_TAG, "Failed to create .hushlogin: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Download the official Termux bootstrap archive for the device ABI.
+     * Releases are published at:
+     * https://github.com/termux/termux-packages/releases/latest/download/bootstrap-&lt;arch&gt;.zip
+     */
+    public static byte[] loadZipBytes() {
+        String abi = (Build.SUPPORTED_ABIS != null && Build.SUPPORTED_ABIS.length > 0)
+            ? Build.SUPPORTED_ABIS[0] : "arm64-v8a";
+        String arch;
+        switch (abi) {
+            case "armeabi-v7a": arch = "arm"; break;
+            case "x86":         arch = "i686"; break;
+            case "x86_64":      arch = "x86_64"; break;
+            case "arm64-v8a":
+            default:            arch = "aarch64"; break;
+        }
+
+        String url = "https://github.com/termux/termux-packages/releases/latest/download/bootstrap-" + arch + ".zip";
+        Logger.logInfo(LOG_TAG, "Downloading official bootstrap from " + url + " ...");
+
+        try {
+            HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+            connection.setInstanceFollowRedirects(true);
+            connection.setConnectTimeout(60000);
+            connection.setReadTimeout(120000);
+            connection.setRequestProperty("Accept-Encoding", "identity");
+            connection.connect();
+            int responseCode = connection.getResponseCode();
+            if (responseCode != HttpURLConnection.HTTP_OK)
+                throw new RuntimeException("Failed to download bootstrap: HTTP " + responseCode);
+
+            try (InputStream in = connection.getInputStream();
+                 ByteArrayOutputStream out = new ByteArrayOutputStream(128 * 1024)) {
+                byte[] buffer = new byte[8192];
+                int readBytes;
+                while ((readBytes = in.read(buffer)) != -1)
+                    out.write(buffer, 0, readBytes);
+                Logger.logInfo(LOG_TAG, "Bootstrap downloaded: " + out.size() + " bytes.");
+                return out.toByteArray();
+            } finally {
+                connection.disconnect();
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to download bootstrap from " + url, e);
+        }
+    }
+
+}
